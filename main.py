@@ -266,7 +266,7 @@ class RenderWebhookHandler(BaseHTTPRequestHandler):
                     f"💎 نماد: `{symbol}`\n"
                     f"💵 قیمت خروج: `{exit_price}`\n"
                     f"📊 نتیجه: **{status_text} با {pnl:+.2f}%**\n"
-                    f"🏷 صرافی: `آبان‌تتر (AbanTether)`"
+                    f"🏷 صرافی: `والکس (Wallex)`"
                 )
                 TelegramNotifier.send_to_personal(close_msg)
 
