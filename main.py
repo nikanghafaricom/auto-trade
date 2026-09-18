@@ -8,7 +8,7 @@ import gc
 import json
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date as date_cls
 from typing import Dict, Optional, List, Tuple
 import pandas as pd
 import ccxt
@@ -41,7 +41,24 @@ class Config:
         "ADA/USDT",
         "DOGE/USDT",
         "LINK/USDT",
+        "PAXG/USDT",
+        "LTC/USDT",
     ]
+
+    SYMBOL_GROUPS = {
+        "BTC/USDT": "majors",
+        "ETH/USDT": "majors",
+        "BNB/USDT": "majors",
+        "LTC/USDT": "majors",
+        "SOL/USDT": "L1_alt",
+        "AVAX/USDT": "L1_alt",
+        "NEAR/USDT": "L1_alt",
+        "ADA/USDT": "L1_alt",
+        "XRP/USDT": "payments",
+        "DOGE/USDT": "meme",
+        "LINK/USDT": "oracle",
+        "PAXG/USDT": "defensive_gold",
+    }
 
     ENTRY_TIMEFRAME = "15m"
     TREND_TIMEFRAME = "4h"
@@ -58,6 +75,19 @@ class Config:
     RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", 1.5))
     # تعداد کندل ۴ساعته برای warmup واقعی EMA200
     TREND_WARMUP_CANDLES = 300
+
+    # ---- مدیریت ریسک، معامله‌ی مجازی و همبستگی (برگرفته از کد مرجع) ----
+    MAX_CONCURRENT_TRADES = int(os.getenv("MAX_CONCURRENT_TRADES", 4))
+    MAX_TRADES_PER_GROUP = int(os.getenv("MAX_TRADES_PER_GROUP", 2))
+    MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", 3.0))
+    EXCHANGE_TAKER_FEE_PCT = float(os.getenv("EXCHANGE_TAKER_FEE_PCT", 0.0))
+    DEFAULT_SPREAD_PCT_FALLBACK = 0.05
+    TRADE_MONITOR_INTERVAL_SECONDS = int(os.getenv("TRADE_MONITOR_INTERVAL_SECONDS", 30))
+    CORRELATION_LOOKBACK_CANDLES = 100
+    CORRELATION_REFRESH_HOURS = 1
+    CORRELATION_THRESHOLD_MIN = 0.6
+    CORRELATION_THRESHOLD_MAX = 0.8
+    MAX_CORRELATED_TRADES = int(os.getenv("MAX_CORRELATED_TRADES", 2))
 
     def validate(self):
         if not self.TELEGRAM_BOT_TOKEN or (not self.TELEGRAM_CHANNEL_ID and not self.TELEGRAM_PERSONAL_ID):
@@ -864,6 +894,384 @@ class SignalEngine:
             "btc_volatility_pctl": btc_volatility_pctl
         }
 
+# ==================== ماتریس همبستگی داینامیک ====================
+class CorrelationManager:
+    """
+    جایگزین گروه‌بندی ثابت SYMBOL_GROUPS برای تصمیم اکسپوژر همبسته. هر
+    CORRELATION_REFRESH_HOURS یک‌بار، همبستگی بازدهی نمادها روی تایم‌فریم ورودی
+    بازمحاسبه می‌شه. آستانه‌ی همبستگی بین MIN (در استرس بازار) تا MAX (در آرامش بازار)
+    بر اساس پرسنتایل نوسان لحظه‌ای بیت‌کوین حرکت می‌کنه. بدون فراخوانی اضافه‌ی Groq.
+    در نبود داده‌ی کافی، به گروه‌بندی ثابت برمی‌گرده.
+    """
+    def __init__(self, config: Config, data_layer):
+        self.config = config
+        self.data = data_layer
+        self.matrix: Optional[pd.DataFrame] = None
+        self.last_computed: Optional[datetime] = None
+
+    def should_refresh(self) -> bool:
+        if self.matrix is None or self.last_computed is None:
+            return True
+        return datetime.now() - self.last_computed >= timedelta(hours=self.config.CORRELATION_REFRESH_HOURS)
+
+    def refresh(self):
+        closes = {}
+        for symbol in self.config.SYMBOLS:
+            df = self.data.fetch_ohlcv_df(symbol, self.config.ENTRY_TIMEFRAME, limit=self.config.CORRELATION_LOOKBACK_CANDLES)
+            if df.empty or len(df) < 30:
+                continue
+            closes[symbol] = df.set_index('timestamp')['close']
+        if len(closes) < 2:
+            logger.warning("ماتریس همبستگی: داده‌ی کافی برای حداقل ۲ نماد در دسترس نبود - این چرخه رد شد.")
+            return
+        try:
+            price_df = pd.DataFrame(closes).dropna()
+            if len(price_df) < 20:
+                return
+            returns = price_df.pct_change().dropna()
+            self.matrix = returns.corr()
+            self.last_computed = datetime.now()
+            logger.info("ماتریس همبستگی داینامیک بازمحاسبه شد.")
+        except Exception as e:
+            logger.error(f"خطا در محاسبه‌ی ماتریس همبستگی: {e}")
+
+    def get_dynamic_threshold(self, btc_volatility_pctl: Optional[float]) -> float:
+        lo, hi = self.config.CORRELATION_THRESHOLD_MIN, self.config.CORRELATION_THRESHOLD_MAX
+        if btc_volatility_pctl is None:
+            return (lo + hi) / 2
+        frac = max(0.0, min(1.0, btc_volatility_pctl / 100))
+        return hi - frac * (hi - lo)
+
+    def correlated_count(self, symbol: str, active_trades: Dict, threshold: float) -> int:
+        if self.matrix is None or symbol not in self.matrix:
+            group = self.config.SYMBOL_GROUPS.get(symbol, "other")
+            return sum(1 for t in active_trades.values() if self.config.SYMBOL_GROUPS.get(t['symbol'], "other") == group)
+        count = 0
+        for t in active_trades.values():
+            other = t['symbol']
+            if other == symbol:
+                continue
+            if other in self.matrix.index:
+                corr = self.matrix.loc[symbol, other]
+                if pd.notna(corr) and abs(corr) >= threshold:
+                    count += 1
+        return count
+
+# ==================== مدیریت ریسک و سرمایه ====================
+class RiskManager:
+    def __init__(self, config: Config):
+        self.config = config
+
+    def calculate_position_size(self, entry: float, stop: float, size_mult: float = 1.0) -> float:
+        risk_amount = self.config.VIRTUAL_CAPITAL_USDT * (self.config.RISK_PER_TRADE_PCT / 100) * size_mult
+        risk_per_unit = abs(entry - stop)
+        if risk_per_unit <= 0:
+            return 0.0
+        return risk_amount / risk_per_unit
+
+    def can_open_trade(self, symbol: str, active_trades: Dict, correlation_manager: Optional["CorrelationManager"] = None,
+                        btc_volatility_pctl: Optional[float] = None) -> Tuple[bool, str]:
+        if correlation_manager is not None:
+            threshold = correlation_manager.get_dynamic_threshold(btc_volatility_pctl)
+            corr_count = correlation_manager.correlated_count(symbol, active_trades, threshold)
+            if corr_count >= self.config.MAX_CORRELATED_TRADES:
+                return False, f"به سقف اکسپوژر همبسته رسیدیم (آستانه‌ی لحظه‌ای {threshold:.2f}، ریسک همبستگی)"
+        else:
+            group = self.config.SYMBOL_GROUPS.get(symbol, "other")
+            group_count = sum(
+                1 for t in active_trades.values()
+                if self.config.SYMBOL_GROUPS.get(t['symbol'], "other") == group
+            )
+            if group_count >= self.config.MAX_TRADES_PER_GROUP:
+                return False, f"به سقف اکسپوژر گروه {group} رسیدیم (ریسک همبستگی)"
+
+        return True, ""
+
+    def kill_switch_triggered(self, journal: "TradeJournal") -> bool:
+        today_pnl = journal.get_today_realized_pnl_usdt()
+        loss_limit = -(self.config.VIRTUAL_CAPITAL_USDT * self.config.MAX_DAILY_LOSS_PCT / 100)
+        return today_pnl <= loss_limit
+
+# ==================== ژورنال معاملات ====================
+class TradeJournal:
+    def __init__(self, path: str = "trade_history.json"):
+        self.path = path
+        self.records: List[Dict] = self._load()
+
+    def _load(self) -> List[Dict]:
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return []
+        return []
+
+    def _save(self):
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self.records, f, indent=2)
+        except Exception as e:
+            logger.error(f"خطا در ذخیره ژورنال معاملات: {e}")
+
+    def record(self, symbol: str, side: str, reason: str, pnl_usdt: float, pnl_pct: float, r_multiple: float, closed_pct: float):
+        self.records.append({
+            "date": date_cls.today().isoformat(),
+            "timestamp": datetime.now().isoformat(),
+            "symbol": symbol,
+            "side": side,
+            "reason": reason,
+            "pnl_usdt": round(pnl_usdt, 2),
+            "pnl_pct": round(pnl_pct, 3),
+            "r_multiple": round(r_multiple, 2),
+            "closed_pct": closed_pct
+        })
+        self._save()
+
+    def get_today_realized_pnl_usdt(self) -> float:
+        today = date_cls.today().isoformat()
+        return sum(r["pnl_usdt"] for r in self.records if r["date"] == today)
+
+    def get_side_performance(self, symbol: str, side: str, lookback: int = 15) -> Dict:
+        side_records = [r for r in self.records if r["symbol"] == symbol and r["side"] == side]
+        if not side_records:
+            return {"count": 0, "win_rate": None, "avg_r": None, "total_pnl_usdt": 0.0}
+        recent = side_records[-lookback:]
+        wins = [r for r in recent if r["pnl_usdt"] > 0]
+        return {
+            "count": len(recent),
+            "win_rate": round((len(wins) / len(recent)) * 100, 1),
+            "avg_r": round(sum(r["r_multiple"] for r in recent) / len(recent), 2),
+            "total_pnl_usdt": round(sum(r["pnl_usdt"] for r in recent), 2)
+        }
+
+    def get_side_stats_for_date(self, for_date: str) -> Dict[str, Dict]:
+        day_records = [r for r in self.records if r["date"] == for_date]
+        result = {}
+        for side in ["BUY", "SELL"]:
+            side_recs = [r for r in day_records if r["side"] == side]
+            if not side_recs:
+                result[side] = {"count": 0, "win_rate": 0.0, "avg_r": 0.0, "total_pnl": 0.0}
+                continue
+            wins = [r for r in side_recs if r["pnl_usdt"] > 0]
+            result[side] = {
+                "count": len(side_recs),
+                "win_rate": round((len(wins) / len(side_recs)) * 100, 1),
+                "avg_r": round(sum(r["r_multiple"] for r in side_recs) / len(side_recs), 2),
+                "total_pnl": round(sum(r["pnl_usdt"] for r in side_recs), 2)
+            }
+        return result
+
+    def build_daily_summary(self, for_date: str) -> Optional[str]:
+        day_records = [r for r in self.records if r["date"] == for_date]
+        if not day_records:
+            return None
+        total_pnl = sum(r["pnl_usdt"] for r in day_records)
+        wins = [r for r in day_records if r["pnl_usdt"] > 0]
+        losses = [r for r in day_records if r["pnl_usdt"] <= 0]
+        win_rate = (len(wins) / len(day_records)) * 100 if day_records else 0
+        avg_r = sum(r["r_multiple"] for r in day_records) / len(day_records) if day_records else 0
+
+        side_stats = self.get_side_stats_for_date(for_date)
+        buy_s, sell_s = side_stats["BUY"], side_stats["SELL"]
+
+        return f"""
+📊 **گزارش عملکرد روزانه ({for_date})**
+
+🔢 تعداد رخدادهای بسته‌شده: {len(day_records)}
+✅ برد: {len(wins)} | ❌ باخت: {len(losses)}
+🎯 نرخ برد کل: {win_rate:.1f}%
+📈 سود/زیان کل: {total_pnl:+.2f} USDT
+📐 میانگین R به‌ازای هر رخداد: {avg_r:+.2f}R
+
+🟢 **BUY (Long):** {buy_s['count']} رخداد | نرخ برد {buy_s['win_rate']:.1f}% | میانگین R {buy_s['avg_r']:+.2f} | PnL {buy_s['total_pnl']:+.2f} USDT
+🔴 **SELL (Short):** {sell_s['count']} رخداد | نرخ برد {sell_s['win_rate']:.1f}% | میانگین R {sell_s['avg_r']:+.2f} | PnL {sell_s['total_pnl']:+.2f} USDT
+"""
+
+# ==================== ماژول معامله مجازی: حجم واقعی، پله‌ای، تریلینگ واقعی ====================
+class PaperTrader:
+    def __init__(self, config: Config, ai_optimizer: AIParameterOptimizer, journal: TradeJournal):
+        self.config = config
+        self.ai_optimizer = ai_optimizer
+        self.journal = journal
+        self.file_path = "paper_trades.json"
+        self.active_trades = self._load_trades()
+        # دو ترد (چرخه‌ی اصلی + مانیتورینگ لحظه‌ای) هم‌زمان به active_trades دسترسی دارن
+        self.lock = threading.Lock()
+
+    def _load_trades(self) -> Dict:
+        if os.path.exists(self.file_path):
+            try:
+                with open(self.file_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+        return {}
+
+    def _save_trades(self):
+        try:
+            with open(self.file_path, "w", encoding="utf-8") as f:
+                json.dump(self.active_trades, f, indent=4)
+        except Exception as e:
+            logger.error(f"خطا در ذخیره معاملات مجازی: {e}")
+
+    def snapshot_active_trades(self) -> Dict:
+        with self.lock:
+            return dict(self.active_trades)
+
+    def get_reference_trade_health(self, reference_symbol: str, recent_hours: float = 3.0) -> Optional[Dict]:
+        with self.lock:
+            open_trades = [t for t in self.active_trades.values() if t['symbol'] == reference_symbol]
+        if open_trades:
+            trade = sorted(open_trades, key=lambda t: t['open_time'])[-1]
+            side = trade['side']
+            entry = trade['entry']
+            original_sl = trade['original_sl']
+            risk = abs(entry - original_sl)
+            if risk <= 0:
+                return None
+            if trade.get('tp1_hit'):
+                return {"side": side, "health": 1.0}
+            if side == "BUY":
+                favorable = trade['highest_since_entry'] - entry
+                unfavorable = entry - trade['lowest_since_entry']
+            else:
+                favorable = entry - trade['lowest_since_entry']
+                unfavorable = trade['highest_since_entry'] - entry
+            health = (favorable - unfavorable) / risk
+            return {"side": side, "health": max(-1.0, min(1.0, health))}
+
+        recent_records = [
+            r for r in self.journal.records
+            if r["symbol"] == reference_symbol
+            and datetime.now() - datetime.fromisoformat(r["timestamp"]) <= timedelta(hours=recent_hours)
+        ]
+        if not recent_records:
+            return None
+        last = sorted(recent_records, key=lambda r: r["timestamp"])[-1]
+        return {"side": last["side"], "health": 1.0 if last["pnl_usdt"] > 0 else -1.0}
+
+    def open_virtual_trade(self, symbol: str, side: str, entry_price: float, tp1: float, tp2: float, tp3: float,
+                            sl: float, qty: float, atr_at_entry: float, spread_pct_at_entry: Optional[float] = None):
+        trade_id = f"{symbol}_{int(time.time())}"
+        with self.lock:
+            self.active_trades[trade_id] = {
+                "symbol": symbol,
+                "side": side,
+                "entry": entry_price,
+                "tp1": tp1, "tp2": tp2, "tp3": tp3,
+                "sl": sl,
+                "original_sl": sl,
+                "qty": qty,
+                "atr_at_entry": atr_at_entry,
+                "spread_pct_at_entry": spread_pct_at_entry,
+                "remaining_pct": 100,
+                "tp1_hit": False,
+                "tp2_hit": False,
+                "highest_since_entry": entry_price,
+                "lowest_since_entry": entry_price,
+                "open_time": datetime.now().strftime('%Y-%m-%d %H:%M')
+            }
+            self._save_trades()
+
+    def _close_partial(self, trade: Dict, exit_price: float, reason: str, closed_pct: float, register_result: bool = True):
+        side = trade['side']
+        entry = trade['entry']
+        price_diff = (exit_price - entry) if side == "BUY" else (entry - exit_price)
+
+        # مدل‌سازی کارمزد + اسلیپیج (نصف اسپرد زمان ورود برای هر طرف)
+        spread_estimate_pct = trade.get('spread_pct_at_entry')
+        if spread_estimate_pct is None:
+            spread_estimate_pct = self.config.DEFAULT_SPREAD_PCT_FALLBACK
+        cost_pct_per_side = (self.config.EXCHANGE_TAKER_FEE_PCT + (spread_estimate_pct / 2)) / 100
+        execution_cost_per_unit = (entry + exit_price) * cost_pct_per_side
+        price_diff -= execution_cost_per_unit
+
+        risk_per_unit = abs(entry - trade['original_sl'])
+        r_multiple = (price_diff / risk_per_unit) if risk_per_unit > 0 else 0.0
+        qty_closed = trade['qty'] * (closed_pct / 100)
+        pnl_usdt = price_diff * qty_closed
+        pnl_pct = (price_diff / entry) * 100
+
+        if register_result:
+            if price_diff > 0:
+                self.ai_optimizer.register_win(trade['symbol'])
+            else:
+                self.ai_optimizer.register_loss(trade['symbol'])
+
+        self.journal.record(trade['symbol'], side, reason, pnl_usdt, pnl_pct, r_multiple, closed_pct)
+
+        emoji = "✅" if pnl_usdt > 0 else ("⚪" if pnl_usdt == 0 else "❌")
+        msg = f"""
+{emoji} **گزارش معامله محافظت‌شده**
+
+📌 **ارز:** {trade['symbol']} ({side})
+📎 **علت:** {reason}
+📈 **سود/زیان این مرحله (بعد از کارمزد/اسلیپیج تخمینی):** {pnl_pct:+.2f}% ({pnl_usdt:+.2f} USDT)
+📐 **R Multiple:** {r_multiple:+.2f}R
+📦 **درصد بسته‌شده:** {closed_pct}%
+"""
+        TelegramNotifier.send_to_personal(msg)
+
+    def update_and_check_trades(self, data_layer):
+        with self.lock:
+            if not self.active_trades:
+                return
+
+            for trade_id, trade in list(self.active_trades.items()):
+                try:
+                    df = data_layer.fetch_ohlcv_df(trade['symbol'], "1m", limit=5)
+                    if df.empty:
+                        continue
+                    latest_high = float(df['high'].max())
+                    latest_low = float(df['low'].min())
+                    side = trade['side']
+
+                    trade['highest_since_entry'] = max(trade['highest_since_entry'], latest_high)
+                    trade['lowest_since_entry'] = min(trade['lowest_since_entry'], latest_low)
+
+                    hit_sl = (side == "BUY" and latest_low <= trade['sl']) or (side == "SELL" and latest_high >= trade['sl'])
+                    if hit_sl:
+                        is_breakeven = trade['tp1_hit'] and abs(trade['sl'] - trade['entry']) / trade['entry'] < 0.001
+                        reason = "بسته‌شدن با سود قفل‌شده (Break-even)" if is_breakeven else "برخورد به حد ضرر"
+                        self._close_partial(trade, trade['sl'], reason, trade['remaining_pct'], register_result=not is_breakeven)
+                        del self.active_trades[trade_id]
+                        continue
+
+                    hit_tp3 = (side == "BUY" and latest_high >= trade['tp3']) or (side == "SELL" and latest_low <= trade['tp3'])
+                    if hit_tp3:
+                        self._close_partial(trade, trade['tp3'], "برخورد به TP3 (خروج کامل)", trade['remaining_pct'])
+                        del self.active_trades[trade_id]
+                        continue
+
+                    hit_tp2 = (side == "BUY" and latest_high >= trade['tp2']) or (side == "SELL" and latest_low <= trade['tp2'])
+                    if hit_tp2 and not trade['tp2_hit']:
+                        self._close_partial(trade, trade['tp2'], "برخورد به TP2 (بستن جزئی ۳۰٪)", 30)
+                        trade['remaining_pct'] -= 30
+                        trade['tp2_hit'] = True
+
+                    hit_tp1 = (side == "BUY" and latest_high >= trade['tp1']) or (side == "SELL" and latest_low <= trade['tp1'])
+                    if hit_tp1 and not trade['tp1_hit']:
+                        self._close_partial(trade, trade['tp1'], "برخورد به TP1 (بستن جزئی ۵۰٪ + SL به سر به سر)", 50)
+                        trade['remaining_pct'] -= 50
+                        trade['tp1_hit'] = True
+                        trade['sl'] = trade['entry']
+
+                    if trade['tp1_hit'] and trade['remaining_pct'] > 0:
+                        p = self.ai_optimizer.get_params(trade['symbol'])
+                        atr = trade['atr_at_entry']
+                        if side == "BUY":
+                            new_trail = trade['highest_since_entry'] - (p["trailing_mult"] * atr)
+                            trade['sl'] = max(trade['sl'], round(new_trail, 6))
+                        else:
+                            new_trail = trade['lowest_since_entry'] + (p["trailing_mult"] * atr)
+                            trade['sl'] = min(trade['sl'], round(new_trail, 6))
+
+                    self._save_trades()
+
+                except Exception as e:
+                    logger.error(f"خطا در بررسی معامله مجازی {trade_id}: {e}")
+
 # ==================== ارسال‌کننده پیام به تلگرام ====================
 class TelegramNotifier:
     @staticmethod
@@ -871,7 +1279,7 @@ class TelegramNotifier:
                          judge_reason: str = "", judge_confidence: int = 0):
         config = Config()
         if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHANNEL_ID:
-            return
+            return True  # کانال تنظیم نشده: مثل قبل، بقیه‌ی مسیر ادامه پیدا می‌کنه
         try:
             emoji = "🟢" if side == "BUY" else "🔴"
             direction = "LONG" if side == "BUY" else "SHORT"
@@ -913,10 +1321,28 @@ class TelegramNotifier:
                 "text": message,
                 "parse_mode": "Markdown"
             }
-            requests.post(url, json=payload, timeout=10)
+            r = requests.post(url, json=payload, timeout=10)
+            if r.status_code != 200:
+                logger.error(f"ارسال سیگنال ناموفق بود: {r.status_code} {r.text}")
+                return False
             logger.info("پیام سیگنال با موفقیت به کانال تلگرام ارسال شد.")
+            return True
         except Exception as e:
             logger.error(f"خطا در ارسال پیام به کانال تلگرام: {e}")
+            return False
+
+    @staticmethod
+    def send_system_status(text: str):
+        config = Config()
+        if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHANNEL_ID:
+            return
+        try:
+            url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
+            r = requests.post(url, json={"chat_id": config.TELEGRAM_CHANNEL_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
+            if r.status_code != 200:
+                logger.error(f"ارسال پیام وضعیت ناموفق بود: {r.status_code} {r.text}")
+        except Exception as e:
+            logger.error(f"خطای ارسال پیام به تلگرام: {e}")
 
     @staticmethod
     def send_to_personal(message: str):
@@ -1116,10 +1542,19 @@ class RenderSignalSystem:
         self.macro_data = MacroDataLayer()
         self.ai_optimizer = AIParameterOptimizer(self.config)
         self.signal_engine = SignalEngine(self.config, self.ai_optimizer, self.analysis)
+        self.risk_manager = RiskManager(self.config)
+        self.journal = TradeJournal()
+        self.paper_trader = PaperTrader(self.config, self.ai_optimizer, self.journal)
+        self.correlation_manager = CorrelationManager(self.config, self.data_fetcher)
         # وقتی سهمیه‌ی Groq تموم/برگشت یا اتصال قطع/برقرار شد، از همین مسیر به تلگرام خبر بده
         self.ai_optimizer.on_quota_exhausted_callback = self._send_crash_alert
         self.running = True
         self.last_signal_time: Dict[str, datetime] = {}
+        self.last_summary_date: Optional[str] = date_cls.today().isoformat()
+        self.kill_switch_warned_today = False
+        # واچ‌داگ قطعی داده/API
+        self.consecutive_full_cycle_failures = 0
+        self.data_outage_alert_sent = False
 
     def _send_crash_alert(self, text: str):
         try:
@@ -1137,6 +1572,20 @@ class RenderSignalSystem:
         except Exception as e:
             logger.error(f"خطا در ارسال سیگنال به همروش: {e}")
 
+    def _start_trade_monitor_thread(self):
+        """ترد مستقل مانیتورینگ معاملات باز (هر TRADE_MONITOR_INTERVAL_SECONDS ثانیه)، بدون فراخوانی Groq."""
+        def monitor_loop():
+            while self.running:
+                try:
+                    self.paper_trader.update_and_check_trades(self.data_fetcher)
+                except Exception as e:
+                    logger.error(f"خطا در ترد مانیتورینگ لحظه‌ای معاملات: {e}")
+                    self._send_crash_alert(f"خطا در ترد مانیتورینگ معاملات باز:\n`{e}`")
+                time.sleep(self.config.TRADE_MONITOR_INTERVAL_SECONDS)
+
+        threading.Thread(target=monitor_loop, daemon=True, name="TradeMonitor").start()
+        logger.info(f"ترد مانیتورینگ لحظه‌ای معاملات فعال شد (هر {self.config.TRADE_MONITOR_INTERVAL_SECONDS} ثانیه)")
+
     def _build_macro_context(self) -> dict:
         context = {"fear_greed": None, "btc_trend_4h": None, "btc_structure": None, "btc_volatility_pctl": None,
                    "btc_reference_trade": None, "btc_rsi": None, "btc_macd_hist": None}
@@ -1144,6 +1593,11 @@ class RenderSignalSystem:
             context["fear_greed"] = self.macro_data.get_fear_greed_index()
         except Exception as e:
             logger.warning(f"خطا در دریافت شاخص ترس‌وطمع: {e}")
+
+        try:
+            context["btc_reference_trade"] = self.paper_trader.get_reference_trade_health("BTC/USDT")
+        except Exception as e:
+            logger.warning(f"خطا در دریافت وضعیت معامله‌ی مرجع بیت‌کوین: {e}")
 
         try:
             btc_df_4h = self.data_fetcher.fetch_ohlcv_df("BTC/USDT", self.config.TREND_TIMEFRAME, limit=self.config.TREND_WARMUP_CANDLES)
@@ -1165,76 +1619,157 @@ class RenderSignalSystem:
 
         return context
 
-    def process_symbol(self, symbol: str, macro_context: Optional[dict] = None):
-        df_15m = self.data_fetcher.fetch_ohlcv_df(symbol, self.config.ENTRY_TIMEFRAME)
-        df_15m = self.analysis.calculate_indicators(df_15m)
-        if df_15m.empty:
-            return
+    def process_symbol(self, symbol: str, macro_context: Optional[dict] = None) -> bool:
+        """خروجی: True یعنی دریافت داده‌ی این نماد موفق بود (حتی اگه سیگنالی صادر نشد)،
+        False یعنی fetch داده شکست خورد - برای واچ‌داگ قطعی API."""
+        try:
+            df_15m = self.data_fetcher.fetch_ohlcv_df(symbol, self.config.ENTRY_TIMEFRAME)
+            df_15m = self.analysis.calculate_indicators(df_15m)
+            if df_15m.empty:
+                return False
 
-        if self.ai_optimizer.should_optimize(symbol):
-            logger.info(f"بروزرسانی پارامترهای ضد ضرر هوش مصنوعی برای {symbol}...")
-            self.ai_optimizer.optimize_symbol_parameters(symbol, df_15m)
+            if self.ai_optimizer.should_optimize(symbol):
+                logger.info(f"بروزرسانی پارامترهای ضد ضرر هوش مصنوعی برای {symbol}...")
+                self.ai_optimizer.optimize_symbol_parameters(symbol, df_15m, journal=self.journal)
 
-        df_1h = self.data_fetcher.fetch_ohlcv_df(symbol, self.config.CONFIRM_TIMEFRAME)
-        df_1h = self.analysis.calculate_indicators(df_1h)
+            df_1h = self.data_fetcher.fetch_ohlcv_df(symbol, self.config.CONFIRM_TIMEFRAME)
+            df_1h = self.analysis.calculate_indicators(df_1h)
 
-        df_4h = self.data_fetcher.fetch_ohlcv_df(symbol, self.config.TREND_TIMEFRAME, limit=self.config.TREND_WARMUP_CANDLES)
-        df_4h = self.analysis.calculate_indicators(df_4h)
-        trend = self.analysis.get_major_trend(df_4h)
+            df_4h = self.data_fetcher.fetch_ohlcv_df(symbol, self.config.TREND_TIMEFRAME, limit=self.config.TREND_WARMUP_CANDLES)
+            df_4h = self.analysis.calculate_indicators(df_4h)
+            trend = self.analysis.get_major_trend(df_4h)
 
-        symbol_macro_context = dict(macro_context or {})
-        symbol_macro_context["funding_rate"] = self.data_fetcher.fetch_funding_rate(symbol)
-        symbol_macro_context["spread_pct"] = self.data_fetcher.fetch_spread_pct(symbol)
+            symbol_macro_context = dict(macro_context or {})
+            symbol_macro_context["funding_rate"] = self.data_fetcher.fetch_funding_rate(symbol)
+            symbol_macro_context["spread_pct"] = self.data_fetcher.fetch_spread_pct(symbol)
 
-        rule_signal, diagnostics = self.signal_engine.get_rule_signal(symbol, df_15m, df_1h, trend, symbol_macro_context)
-        if not rule_signal:
-            return
+            rule_signal, diagnostics = self.signal_engine.get_rule_signal(symbol, df_15m, df_1h, trend, symbol_macro_context)
+            if not rule_signal:
+                return True
 
-        now = datetime.now()
-        p = self.ai_optimizer.get_params(symbol)
-        cooldown = p.get("cooldown_minutes", 90)
-        if symbol in self.last_signal_time:
-            if now - self.last_signal_time[symbol] < timedelta(minutes=cooldown):
-                return
+            now = datetime.now()
+            p = self.ai_optimizer.get_params(symbol)
+            cooldown = p.get("cooldown_minutes", 90)
+            if symbol in self.last_signal_time:
+                if now - self.last_signal_time[symbol] < timedelta(minutes=cooldown):
+                    return True
 
-        judge = self.ai_optimizer.evaluate_trade_candidate(symbol, rule_signal, diagnostics)
-        if not judge["approve"] or judge["confidence"] < self.config.MIN_JUDGE_CONFIDENCE:
-            logger.info(f"{symbol}: سیگنال {rule_signal} توسط لایه‌ی قضاوت AI رد شد (اطمینان {judge['confidence']}%) - {judge['reason']}")
-            return
+            if self.risk_manager.kill_switch_triggered(self.journal):
+                if not self.kill_switch_warned_today:
+                    logger.warning("کلید قطع ضرر روزانه فعال شد - تا فردا سیگنال جدیدی صادر نمی‌شه")
+                    TelegramNotifier.send_system_status("🛑 **کلید قطع ضرر روزانه فعال شد.** برای امروز دیگه معامله‌ی جدیدی باز نمی‌شه.")
+                    self.kill_switch_warned_today = True
+                return True
 
-        latest = df_15m.iloc[-1]
-        levels = self.signal_engine.calculate_trade_levels(symbol, rule_signal, latest, symbol_macro_context)
+            active_trades_snapshot = self.paper_trader.snapshot_active_trades()
+            can_open, reason = self.risk_manager.can_open_trade(
+                symbol, active_trades_snapshot,
+                correlation_manager=self.correlation_manager,
+                btc_volatility_pctl=(macro_context or {}).get("btc_volatility_pctl")
+            )
+            if not can_open:
+                logger.info(f"{symbol}: سیگنال {rule_signal} رد شد - {reason}")
+                return True
 
-        TelegramNotifier.send_to_channel(symbol, rule_signal, latest, trend, levels,
-                                          judge_reason=judge["reason"], judge_confidence=judge["confidence"])
+            diagnostics["open_positions_count"] = len(active_trades_snapshot)
+            diagnostics["today_realized_pnl_usdt"] = round(self.journal.get_today_realized_pnl_usdt(), 2)
+            judge = self.ai_optimizer.evaluate_trade_candidate(symbol, rule_signal, diagnostics)
+            if not judge["approve"] or judge["confidence"] < self.config.MIN_JUDGE_CONFIDENCE:
+                logger.info(f"{symbol}: سیگنال {rule_signal} توسط لایه‌ی قضاوت AI رد شد (اطمینان {judge['confidence']}%) - {judge['reason']}")
+                return True
 
-        payload = {
-            "action": "execute_trade",
-            "symbol": symbol,
-            "side": rule_signal,
-            "price": levels["price"],
-            "trend": trend,
-            "tp1": levels["tp1"],
-            "tp2": levels["tp2"],
-            "tp3": levels["tp3"],
-            "sl": levels["sl"]
-        }
-        self.send_signal_to_hamravesh(payload)
-        self.last_signal_time[symbol] = now
+            latest = df_15m.iloc[-1]
+            levels = self.signal_engine.calculate_trade_levels(symbol, rule_signal, latest, symbol_macro_context)
+
+            sent_ok = TelegramNotifier.send_to_channel(symbol, rule_signal, latest, trend, levels,
+                                                        judge_reason=judge["reason"], judge_confidence=judge["confidence"])
+
+            if sent_ok:
+                payload = {
+                    "action": "execute_trade",
+                    "symbol": symbol,
+                    "side": rule_signal,
+                    "price": levels["price"],
+                    "trend": trend,
+                    "tp1": levels["tp1"],
+                    "tp2": levels["tp2"],
+                    "tp3": levels["tp3"],
+                    "sl": levels["sl"]
+                }
+                self.send_signal_to_hamravesh(payload)
+
+                self.paper_trader.open_virtual_trade(
+                    symbol=symbol,
+                    side=rule_signal,
+                    entry_price=levels["price"],
+                    tp1=levels["tp1"],
+                    tp2=levels["tp2"],
+                    tp3=levels["tp3"],
+                    sl=levels["sl"],
+                    qty=levels["qty"],
+                    atr_at_entry=levels["atr"],
+                    spread_pct_at_entry=symbol_macro_context.get("spread_pct")
+                )
+                self.last_signal_time[symbol] = now
+
+            return True
+
+        except Exception as e:
+            logger.error(f"خطا در پردازش {symbol}: {e}")
+            return False
+
+    def _check_daily_rollover(self):
+        today = date_cls.today().isoformat()
+        if self.last_summary_date and today != self.last_summary_date:
+            summary = self.journal.build_daily_summary(self.last_summary_date)
+            if summary:
+                TelegramNotifier.send_system_status(summary)
+            self.last_summary_date = today
+            self.kill_switch_warned_today = False
+
+    def run_once(self):
+        logger.info("----- شروع آنالیز ایمن و ضد ضرر بازار -----")
+        self._check_daily_rollover()
+
+        if self.correlation_manager.should_refresh():
+            self.correlation_manager.refresh()
+
+        macro_context = self._build_macro_context()
+        fetch_failures = 0
+        for symbol in self.config.SYMBOLS:
+            ok = self.process_symbol(symbol, macro_context)
+            if not ok:
+                fetch_failures += 1
+            time.sleep(1.5)
+
+        if fetch_failures == len(self.config.SYMBOLS):
+            self.consecutive_full_cycle_failures += 1
+        else:
+            self.consecutive_full_cycle_failures = 0
+            self.data_outage_alert_sent = False
+
+        if self.consecutive_full_cycle_failures >= 2 and not self.data_outage_alert_sent:
+            self._send_crash_alert(
+                "دریافت داده برای همه‌ی نمادها در چند چرخه‌ی متوالی ناموفق بود - "
+                "احتمالاً اتصال صرافی/اینترنت مشکل داره. ربات به تلاش ادامه می‌ده."
+            )
+            self.data_outage_alert_sent = True
 
     def run_loop(self):
         logger.info("بخش رندر (Render Signal Generator) با موفقیت فعال شد.")
         threading.Thread(target=verify_and_notify_startup, args=(self.config,), daemon=True).start()
 
-        while self.running:
-            macro_context = self._build_macro_context()
-            for symbol in self.config.SYMBOLS:
-                try:
-                    self.process_symbol(symbol, macro_context)
-                    time.sleep(2)
-                except Exception as e:
-                    logger.error(f"خطا در حلقه پردازش نماد {symbol}: {e}")
+        self._start_trade_monitor_thread()
 
+        while self.running:
+            try:
+                self.run_once()
+            except Exception as e:
+                logger.error(f"خطای پیش‌بینی‌نشده در چرخه‌ی اصلی: {e}")
+                self._send_crash_alert(
+                    f"خطای پیش‌بینی‌نشده در چرخه‌ی اصلی ربات:\n`{e}`\n\n"
+                    "ربات همچنان روشنه و چرخه‌ی بعدی رو امتحان می‌کنه."
+                )
             gc.collect()
             logger.info(f"پایان چرخه بررسی بازار. انتظار برای دور بعدی ({self.config.CHECK_INTERVAL} ثانیه)...")
             time.sleep(self.config.CHECK_INTERVAL)
