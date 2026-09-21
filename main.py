@@ -780,8 +780,17 @@ class SignalEngine:
 
         structure = self.analysis.market_structure(df_15m)
 
-        # ---- فقط پوزیشن Long/BUY (اسپات): امتیاز فروش/شورت از مسیر تصمیم‌گیری حذف شد ----
-        buy_score = self._score_buy(latest, prev, p) if trend_4h in ["BULLISH", "NEUTRAL"] else 0.0
+        # ---- فقط پوزیشن Long/BUY (اسپات) ----
+        # تغییر کلیدی برای کاهش استاپ‌های الکی:
+        # لانگ فقط در رژیم BULLISH یا در NEUTRAL + ساختار صعودی مجاز است.
+        # این کار باعث می‌شود ربات در بازارهای خنثی/نزولی بی‌دلیل لانگ نزند
+        # و بعد از آپدیت پارامترها، با تغییر جو بازار دوباره ضرر ندهد.
+        if trend_4h == "BULLISH":
+            buy_score = self._score_buy(latest, prev, p)
+        elif trend_4h == "NEUTRAL" and structure == "BULLISH":
+            buy_score = self._score_buy(latest, prev, p) * 0.85  # کمی سخت‌گیرانه‌تر در رژیم خنثی
+        else:
+            buy_score = 0.0
 
         if trend_4h == "BULLISH":
             buy_score += 1.0
