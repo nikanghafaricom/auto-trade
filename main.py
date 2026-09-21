@@ -80,7 +80,6 @@ class Config:
     # ---- مدیریت ریسک و همبستگی (عین کد ۱) ----
     MAX_CONCURRENT_TRADES = int(os.getenv("MAX_CONCURRENT_TRADES", 4))
     MAX_TRADES_PER_GROUP = int(os.getenv("MAX_TRADES_PER_GROUP", 2))
-    MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", 3.0))
     EXCHANGE_TAKER_FEE_PCT = float(os.getenv("EXCHANGE_TAKER_FEE_PCT", 0.0))
     DEFAULT_SPREAD_PCT_FALLBACK = 0.05
     CORRELATION_LOOKBACK_CANDLES = 100
@@ -534,11 +533,18 @@ Never make changes so aggressive that they would effectively stop signals from b
 """
 
         prompt = f"""
-You are an advanced quantitative trading AI. First, analyze the following key market data and indicators for asset {symbol}:
+You are an advanced quantitative trading AI whose primary job is to continuously adapt trading parameters to the CURRENT market regime so the bot does not only work right after an update and then start losing.
+
+Current market data and recent performance for {symbol}:
 {json.dumps(market_metrics)}
 {side_perf_note}
-Based on these specific conditions, dynamically tune the trading parameters to adapt to the current market regime.
-Keep risk management strict to prevent losses, but allow reasonable flexibility so the bot can capture valid opportunities within safe logical boundaries.
+
+CRITICAL ADAPTATION RULES:
+- If consecutive_losses is high or recent_buy_performance shows low win_rate / negative avg_r, you MUST tighten entry conditions (raise rsi_buy_min, raise volume_mult, increase cooldown_minutes, raise atr_min_filter) so fewer low-quality longs are taken until the regime improves.
+- If the market looks favorable (healthy volume, reasonable RSI zone, no heavy recent losses), you may moderately loosen parameters to capture more opportunities.
+- Never make changes so extreme that signals completely stop. Stay inside reasonable ranges.
+- Your goal is sustained positive expectancy across changing market regimes, not short-term overfit to the last few candles.
+
 Return ONLY valid JSON with the exact same keys as these default parameters:
 {json.dumps(state["params"])}
 No markdown formatting, no extra text.
@@ -635,9 +641,21 @@ No markdown formatting, no extra text.
             return {"approve": False, "confidence": 0,
                     "reason": "سهمیه‌ی رایگان Groq تموم شده - طبق تنظیم، سیگنال رد شد (تایید AI الزامیه)"}
 
-        prompt = f"""You are a veteran discretionary crypto trader with 15+ years of experience. You deeply understand that markets are not static: regimes shift, correlations break down, momentum exhausts, and no fixed rule set can fully capture that. You are reviewing a trade candidate that ALREADY passed a strict quantitative multi-factor scoring system (trend, RSI momentum, MACD, volume, market structure, multi-timeframe alignment, volatility regime).
+        prompt = f"""You are a veteran discretionary crypto trader with 15+ years of experience. Markets constantly change regime. Your job is NOT to approve every technically valid setup. Your job is to decide whether the CURRENT market regime actually favors a LONG right now.
 
-Your only job now is the kind of contextual judgment an elite human trader adds on top of a systematic setup: given everything below, does the broader picture actually support taking this trade right now, or is there something about the current context (exhaustion, conflicting signals, thin/erratic volume, the symbol's recent losing streak, over-extension) that says skip it even though the numbers look fine?
+The candidate already passed quantitative filters. You must now answer:
+1. Is the broader market regime (trend, structure, BTC behavior, fear/greed, recent performance of this symbol) supportive of a new LONG?
+2. Or is the environment uncertain / choppy / bearish / recently losing, so this long should be skipped even if the indicators look okay?
+
+Be especially strict and prefer REJECT when any of these are true:
+- consecutive_losses_this_symbol > 0 or recent buy performance is weak
+- trend_4h is NEUTRAL or BEARISH
+- market structure is not clearly BULLISH
+- BTC macro trend/structure shows uncertainty or weakness
+- volume is weak or erratic
+- the overall picture feels like the bot is about to repeat a losing streak
+
+Only approve when you genuinely believe the current regime supports a long with positive expectancy. When in doubt, reject.
 
 Trade candidate:
 Symbol: {symbol}
@@ -781,16 +799,11 @@ class SignalEngine:
         structure = self.analysis.market_structure(df_15m)
 
         # ---- فقط پوزیشن Long/BUY (اسپات) ----
-        # تغییر کلیدی برای کاهش استاپ‌های الکی:
-        # لانگ فقط در رژیم BULLISH یا در NEUTRAL + ساختار صعودی مجاز است.
-        # این کار باعث می‌شود ربات در بازارهای خنثی/نزولی بی‌دلیل لانگ نزند
-        # و بعد از آپدیت پارامترها، با تغییر جو بازار دوباره ضرر ندهد.
-        if trend_4h == "BULLISH":
-            buy_score = self._score_buy(latest, prev, p)
-        elif trend_4h == "NEUTRAL" and structure == "BULLISH":
-            buy_score = self._score_buy(latest, prev, p) * 0.85  # کمی سخت‌گیرانه‌تر در رژیم خنثی
-        else:
-            buy_score = 0.0
+        # فیلتر سخت و ثابت رژیم بازار حذف شد.
+        # حالا بار اصلی تشخیص «آیا الان جو بازار برای لانگ مناسب است؟»
+        # روی لایه‌ی قضاوت هوش مصنوعی (Judge) و بهینه‌ساز پارامترهاست
+        # تا ربات خودش را با تغییر جو بازار تطبیق دهد، نه با شرط‌های خشک.
+        buy_score = self._score_buy(latest, prev, p) if trend_4h in ["BULLISH", "NEUTRAL"] else 0.0
 
         if trend_4h == "BULLISH":
             buy_score += 1.0
@@ -1001,11 +1014,6 @@ class RiskManager:
                 return False, f"به سقف اکسپوژر گروه {group} رسیدیم (ریسک همبستگی)"
 
         return True, ""
-
-    def kill_switch_triggered(self, journal: "TradeJournal") -> bool:
-        today_pnl = journal.get_today_realized_pnl_usdt()
-        loss_limit = -(self.config.VIRTUAL_CAPITAL_USDT * self.config.MAX_DAILY_LOSS_PCT / 100)
-        return today_pnl <= loss_limit
 
 # ==================== ژورنال معاملات (تغذیه از فیدبک واقعی همروش) ====================
 class TradeJournal:
@@ -1776,7 +1784,6 @@ class RenderSignalSystem:
         self.running = True
         self.last_signal_time: Dict[str, datetime] = {}
         self.last_summary_date: Optional[str] = date_cls.today().isoformat()
-        self.kill_switch_warned_today = False
         # واچ‌داگ قطعی داده/API
         self.consecutive_full_cycle_failures = 0
         self.data_outage_alert_sent = False
@@ -1953,13 +1960,6 @@ class RenderSignalSystem:
                 if now - self.last_signal_time[symbol] < timedelta(minutes=cooldown):
                     return True
 
-            if self.risk_manager.kill_switch_triggered(self.journal):
-                if not self.kill_switch_warned_today:
-                    logger.warning("کلید قطع ضرر روزانه فعال شد - تا فردا سیگنال جدیدی صادر نمی‌شه")
-                    TelegramNotifier.send_system_status("🛑 **کلید قطع ضرر روزانه فعال شد.** برای امروز دیگه معامله‌ی جدیدی باز نمی‌شه.")
-                    self.kill_switch_warned_today = True
-                return True
-
             active_trades_snapshot = self.active_tracker.snapshot()
             can_open, reason = self.risk_manager.can_open_trade(
                 symbol, active_trades_snapshot,
@@ -2025,7 +2025,6 @@ class RenderSignalSystem:
             if summary:
                 TelegramNotifier.send_system_status(summary)
             self.last_summary_date = today
-            self.kill_switch_warned_today = False
 
     def run_once(self):
         logger.info("----- شروع آنالیز ایمن و ضد ضرر بازار -----")
