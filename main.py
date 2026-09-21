@@ -309,6 +309,16 @@ class AIParameterOptimizer:
         self._consecutive_connection_failures = 0
         self._connection_alert_sent = False
 
+        # ---- تشخیص گیرکردن در سقف نرخ Groq (429 که بعد از تلاش‌های مجدد هم ادامه داره) ----
+        # این بخش جدیده: قبلاً 429 بعد از تلاش مجدد فقط لاگ می‌شد و هشدار تلگرام نمی‌رفت.
+        # بعد از چند بار پیاپی، یه هشدار به چت شخصی می‌ره (حداکثر یک‌بار در هر ساعت تا
+        # اسپم نشه) و با اولین پاسخ موفق بعدش پیام «برگشت» می‌ره.
+        self.RATE_LIMIT_ALERT_THRESHOLD = 2
+        self.RATE_LIMIT_ALERT_COOLDOWN_SECONDS = 3600
+        self._consecutive_rate_limit_hits = 0
+        self._rate_limit_alert_sent = False
+        self._last_rate_limit_alert_ts = 0.0
+
         default_params = {
             "rsi_buy_min": 42,
             "rsi_buy_max_range_start": 48,
@@ -457,6 +467,51 @@ class AIParameterOptimizer:
                     except Exception:
                         pass
 
+    def _register_rate_limit_result(self, hit_429: bool, label: str):
+        """
+        ثبت نتیجه‌ی «سقف نرخ (429)» بعد از اتمام تلاش‌های مجدد. وقتی چند بار پیاپی 429
+        ادامه پیدا کنه، یه هشدار به تلگرام (چت شخصی) می‌ره - حداکثر یک‌بار در هر
+        RATE_LIMIT_ALERT_COOLDOWN_SECONDS. با اولین پاسخ غیر-429 بعد از هشدار، پیام
+        «برگشت به حالت عادی» می‌ره. همه‌چیز با try/except امنه تا هیچ‌وقت باعث کرش نشه.
+        """
+        try:
+            if hit_429:
+                self._consecutive_rate_limit_hits += 1
+                now = time.time()
+                if (self._consecutive_rate_limit_hits >= self.RATE_LIMIT_ALERT_THRESHOLD
+                        and (now - self._last_rate_limit_alert_ts) >= self.RATE_LIMIT_ALERT_COOLDOWN_SECONDS):
+                    self._rate_limit_alert_sent = True
+                    self._last_rate_limit_alert_ts = now
+                    if self.on_quota_exhausted_callback:
+                        rem_req = self.quota.remaining_requests
+                        rem_tok = self.quota.remaining_tokens
+                        try:
+                            self.on_quota_exhausted_callback(
+                                f"⚠️ هوش مصنوعی (Groq) به سقف نرخ/سهمیه خورده و چند بار پیاپی پاسخ 429 داده (آخرین نماد: {label}).\n\n"
+                                f"باقیمانده طبق هدرها: {rem_req if rem_req is not None else '؟'} درخواست / "
+                                f"{rem_tok if rem_tok is not None else '؟'} توکن (عدد توکن سقف هر دقیقه‌ست، نه روزانه)\n\n"
+                                "تا برگشتن وضعیت عادی:\n"
+                                "• تنظیم پارامتر دوره‌ای انجام نمی‌شه (پارامترهای قبلی حفظ می‌شن)\n"
+                                "• لایه‌ی قضاوت هم ممکنه سیگنال‌ها رو رد کنه (تایید AI الزامیه)\n\n"
+                                "اگه این پیام ساعت‌ها تکرار شد، مصرف روزانه‌ی کلید Groq رو تو کنسولش چک کن."
+                            )
+                        except Exception:
+                            pass
+            else:
+                self._consecutive_rate_limit_hits = 0
+                if self._rate_limit_alert_sent:
+                    self._rate_limit_alert_sent = False
+                    if self.on_quota_exhausted_callback:
+                        try:
+                            self.on_quota_exhausted_callback(
+                                "✅ هوش مصنوعی (Groq) دوباره پاسخ عادی می‌ده - سقف نرخ برداشته شد و "
+                                "تنظیم پارامتر و لایه‌ی قضاوت به حالت عادی برگشتن."
+                            )
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
     def _post_with_retry(self, url: str, payload: dict, headers: dict, timeout: int, label: str) -> Optional[requests.Response]:
         for attempt in range(self.MAX_RETRIES_429 + 1):
             self._wait_for_groq_slot()
@@ -472,9 +527,11 @@ class AIParameterOptimizer:
             self.quota.update_from_headers(response.headers)
 
             if response.status_code != 429:
+                self._register_rate_limit_result(False, label)
                 return response
 
             if attempt >= self.MAX_RETRIES_429:
+                self._register_rate_limit_result(True, label)
                 return response
 
             retry_after = response.headers.get("Retry-After") or response.headers.get("retry-after")
@@ -2066,28 +2123,4 @@ class RenderSignalSystem:
 
         logger.info("بخش رندر (Render Signal Generator) با موفقیت فعال شد.")
         threading.Thread(target=verify_and_notify_startup, args=(self.config,), daemon=True).start()
-        threading.Thread(target=self._telegram_updates_loop, daemon=True, name="TelegramCallbacks").start()
-
-        while self.running:
-            try:
-                self.run_once()
-            except Exception as e:
-                logger.error(f"خطای پیش‌بینی‌نشده در چرخه‌ی اصلی: {e}")
-                self._send_crash_alert(
-                    f"خطای پیش‌بینی‌نشده در چرخه‌ی اصلی ربات:\n`{e}`\n\n"
-                    "ربات همچنان روشنه و چرخه‌ی بعدی رو امتحان می‌کنه."
-                )
-            gc.collect()
-            logger.info(f"پایان چرخه بررسی بازار. انتظار برای دور بعدی ({self.config.CHECK_INTERVAL} ثانیه)...")
-            time.sleep(self.config.CHECK_INTERVAL)
-
-    def stop(self):
-        self.running = False
-        logger.info("بخش رندر متوقف شد.")
-
-if __name__ == "__main__":
-    system = RenderSignalSystem()
-    try:
-        system.run_loop()
-    except KeyboardInterrupt:
-        system.stop()
+        threading.Thread(target=self._telegram_updates_loop, da
