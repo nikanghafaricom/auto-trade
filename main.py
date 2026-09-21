@@ -291,10 +291,19 @@ class AIParameterOptimizer:
         self.MAX_RETRIES_429 = 2
         self.MAX_BACKOFF_SECONDS = 8
 
-        # مصرف این بات معمولاً حدود ۵۰۰-۷۰۰ توکن در هر فراخوانیه؛ با سقف ۸٬۰۰۰ توکن/دقیقه
-        # عدد پایین‌تری برای درخواست/دقیقه انتخاب شده
-        self.GROQ_TARGET_RPM = 10
-        self.groq_min_interval_seconds = 60.0 / self.GROQ_TARGET_RPM
+        # ---- فاصله‌گذاری واقعی بر اساس مصرف توکن (نه یه عدد ثابت حدسی) ----
+        # سقف واقعی Groq برای این مدل ۸٬۰۰۰ توکن در دقیقه‌ست. به‌جای فاصله‌ی ثابت بین
+        # درخواست‌ها (که یا خیلی محافظه‌کارانه سرعت رو کند می‌کنه، یا دقیق نیست)، فاصله‌ی
+        # لازم بین هر دو فراخوانی رو از روی مصرف واقعی توکنِ همون فراخوانی حساب می‌کنیم:
+        # فاصله = (توکن تخمینی این فراخوانی / سقف امن در دقیقه) × ۶۰ ثانیه.
+        # TPM_SAFE_LIMIT کمی زیر سقف واقعی ۸۰۰۰ نگه داشته شده (حاشیه‌ی امن برای خطای
+        # تخمین و نوسان طول پاسخ AI).
+        self.TPM_SAFE_LIMIT = 7200
+        self.MIN_GAP_SECONDS = 2.0  # حداقل فاصله‌ی مطلق، حتی برای فراخوانی‌های سبک
+        # تخمین مصرف واقعی هر نوع فراخوانی (پرامپت + سقف پاسخ) - برای محاسبه‌ی فاصله
+        self.ESTIMATED_TOKENS_OPTIMIZE = 750
+        self.ESTIMATED_TOKENS_JUDGE = 650
+        self.ESTIMATED_TOKENS_GUARD = 300
         self._last_groq_call_ts = 0.0
         # ردیاب سهمیه‌ی رایگان - بعد از هر پاسخ Groq با هدرهای واقعی خودش به‌روز می‌شه
         self.quota = GroqQuotaTracker()
@@ -318,6 +327,11 @@ class AIParameterOptimizer:
         self._consecutive_rate_limit_hits = 0
         self._rate_limit_alert_sent = False
         self._last_rate_limit_alert_ts = 0.0
+        self._last_rate_limit_hit_ts = 0.0
+        # بعد از یه 429 نهایی، یه فاصله‌ی امن کوتاه اضافه (فقط به‌عنوان محافظ - مسیر
+        # اصلی جلوگیری از 429 همون فاصله‌گذاری واقعی بالاست، نه این عدد)
+        self.EXTRA_GAP_AFTER_429_SECONDS = 5.0
+
 
         default_params = {
             "rsi_buy_min": 42,
@@ -478,6 +492,7 @@ class AIParameterOptimizer:
             if hit_429:
                 self._consecutive_rate_limit_hits += 1
                 now = time.time()
+                self._last_rate_limit_hit_ts = now
                 if (self._consecutive_rate_limit_hits >= self.RATE_LIMIT_ALERT_THRESHOLD
                         and (now - self._last_rate_limit_alert_ts) >= self.RATE_LIMIT_ALERT_COOLDOWN_SECONDS):
                     self._rate_limit_alert_sent = True
@@ -552,10 +567,23 @@ class AIParameterOptimizer:
                         f"(باقیمانده: {self.quota.remaining_requests} درخواست / {self.quota.remaining_tokens} توکن) - "
                         f"سهمیه برای لایه‌ی قضاوت معامله نگه داشته می‌شه.")
             return False
+
+        # بعد از یه 429 نهایی، چند ثانیه بهینه‌سازی رو نگه می‌داریم تا جا برای لایه‌ی قضاوت بمونه
+        if time.time() - self._last_rate_limit_hit_ts < self.OPTIMIZER_PAUSE_AFTER_429_SECONDS:
+            return False
+
+        # پخش بهینه‌سازی‌ها: بین دو بهینه‌سازی حداقل MIN_SECONDS_BETWEEN_OPTIMIZATIONS ثانیه فاصله
+        if time.time() - self._last_optimization_start_ts < self.MIN_SECONDS_BETWEEN_OPTIMIZATIONS:
+            return False
+
         state = self.symbol_states[symbol]
         if state["last_optimized_time"] is None:
+            self._last_optimization_start_ts = time.time()
             return True
-        return datetime.now() - state["last_optimized_time"] >= self.optimization_interval
+        if datetime.now() - state["last_optimized_time"] >= self.optimization_interval:
+            self._last_optimization_start_ts = time.time()
+            return True
+        return False
 
     def optimize_symbol_parameters(self, symbol: str, df_15m: pd.DataFrame, journal=None):
         if not self.groq_api_key or df_15m.empty:
@@ -2085,42 +2113,4 @@ class RenderSignalSystem:
 
     def run_once(self):
         logger.info("----- شروع آنالیز ایمن و ضد ضرر بازار -----")
-        self._check_daily_rollover()
-
-        if self.correlation_manager.should_refresh():
-            self.correlation_manager.refresh()
-
-        macro_context = self._build_macro_context()
-        # چک سقف ضرر ۸٪ / قفل سود ۲٪ و تصمیم‌های AI مرتبط
-        try:
-            self.daily_guard.update_and_act(macro_context)
-        except Exception as e:
-            logger.error(f"خطا در daily_guard (ادامه بدون کرش): {e}")
-
-        fetch_failures = 0
-        for symbol in self.config.SYMBOLS:
-            ok = self.process_symbol(symbol, macro_context)
-            if not ok:
-                fetch_failures += 1
-            time.sleep(1.5)
-
-        if fetch_failures == len(self.config.SYMBOLS):
-            self.consecutive_full_cycle_failures += 1
-        else:
-            self.consecutive_full_cycle_failures = 0
-            self.data_outage_alert_sent = False
-
-        if self.consecutive_full_cycle_failures >= 2 and not self.data_outage_alert_sent:
-            self._send_crash_alert(
-                "دریافت داده برای همه‌ی نمادها در چند چرخه‌ی متوالی ناموفق بود - "
-                "احتمالاً اتصال صرافی/اینترنت مشکل داره. ربات به تلاش ادامه می‌ده."
-            )
-            self.data_outage_alert_sent = True
-
-    def run_loop(self):
-        global _global_system
-        _global_system = self
-
-        logger.info("بخش رندر (Render Signal Generator) با موفقیت فعال شد.")
-        threading.Thread(target=verify_and_notify_startup, args=(self.config,), daemon=True).start()
-        threading.Thread(target=self._telegram_updates_loop, da
+        self._
