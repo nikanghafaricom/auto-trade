@@ -291,19 +291,10 @@ class AIParameterOptimizer:
         self.MAX_RETRIES_429 = 2
         self.MAX_BACKOFF_SECONDS = 8
 
-        # ---- فاصله‌گذاری واقعی بر اساس مصرف توکن (نه یه عدد ثابت حدسی) ----
-        # سقف واقعی Groq برای این مدل ۸٬۰۰۰ توکن در دقیقه‌ست. به‌جای فاصله‌ی ثابت بین
-        # درخواست‌ها (که یا خیلی محافظه‌کارانه سرعت رو کند می‌کنه، یا دقیق نیست)، فاصله‌ی
-        # لازم بین هر دو فراخوانی رو از روی مصرف واقعی توکنِ همون فراخوانی حساب می‌کنیم:
-        # فاصله = (توکن تخمینی این فراخوانی / سقف امن در دقیقه) × ۶۰ ثانیه.
-        # TPM_SAFE_LIMIT کمی زیر سقف واقعی ۸۰۰۰ نگه داشته شده (حاشیه‌ی امن برای خطای
-        # تخمین و نوسان طول پاسخ AI).
-        self.TPM_SAFE_LIMIT = 7200
-        self.MIN_GAP_SECONDS = 2.0  # حداقل فاصله‌ی مطلق، حتی برای فراخوانی‌های سبک
-        # تخمین مصرف واقعی هر نوع فراخوانی (پرامپت + سقف پاسخ) - برای محاسبه‌ی فاصله
-        self.ESTIMATED_TOKENS_OPTIMIZE = 750
-        self.ESTIMATED_TOKENS_JUDGE = 650
-        self.ESTIMATED_TOKENS_GUARD = 300
+        # مصرف این بات معمولاً حدود ۵۰۰-۷۰۰ توکن در هر فراخوانیه؛ با سقف ۸٬۰۰۰ توکن/دقیقه
+        # عدد پایین‌تری برای درخواست/دقیقه انتخاب شده
+        self.GROQ_TARGET_RPM = 10
+        self.groq_min_interval_seconds = 60.0 / self.GROQ_TARGET_RPM
         self._last_groq_call_ts = 0.0
         # ردیاب سهمیه‌ی رایگان - بعد از هر پاسخ Groq با هدرهای واقعی خودش به‌روز می‌شه
         self.quota = GroqQuotaTracker()
@@ -317,21 +308,6 @@ class AIParameterOptimizer:
         self.CONNECTION_FAILURE_ALERT_THRESHOLD = 3
         self._consecutive_connection_failures = 0
         self._connection_alert_sent = False
-
-        # ---- تشخیص گیرکردن در سقف نرخ Groq (429 که بعد از تلاش‌های مجدد هم ادامه داره) ----
-        # این بخش جدیده: قبلاً 429 بعد از تلاش مجدد فقط لاگ می‌شد و هشدار تلگرام نمی‌رفت.
-        # بعد از چند بار پیاپی، یه هشدار به چت شخصی می‌ره (حداکثر یک‌بار در هر ساعت تا
-        # اسپم نشه) و با اولین پاسخ موفق بعدش پیام «برگشت» می‌ره.
-        self.RATE_LIMIT_ALERT_THRESHOLD = 2
-        self.RATE_LIMIT_ALERT_COOLDOWN_SECONDS = 3600
-        self._consecutive_rate_limit_hits = 0
-        self._rate_limit_alert_sent = False
-        self._last_rate_limit_alert_ts = 0.0
-        self._last_rate_limit_hit_ts = 0.0
-        # بعد از یه 429 نهایی، یه فاصله‌ی امن کوتاه اضافه (فقط به‌عنوان محافظ - مسیر
-        # اصلی جلوگیری از 429 همون فاصله‌گذاری واقعی بالاست، نه این عدد)
-        self.EXTRA_GAP_AFTER_429_SECONDS = 5.0
-
 
         default_params = {
             "rsi_buy_min": 42,
@@ -481,52 +457,6 @@ class AIParameterOptimizer:
                     except Exception:
                         pass
 
-    def _register_rate_limit_result(self, hit_429: bool, label: str):
-        """
-        ثبت نتیجه‌ی «سقف نرخ (429)» بعد از اتمام تلاش‌های مجدد. وقتی چند بار پیاپی 429
-        ادامه پیدا کنه، یه هشدار به تلگرام (چت شخصی) می‌ره - حداکثر یک‌بار در هر
-        RATE_LIMIT_ALERT_COOLDOWN_SECONDS. با اولین پاسخ غیر-429 بعد از هشدار، پیام
-        «برگشت به حالت عادی» می‌ره. همه‌چیز با try/except امنه تا هیچ‌وقت باعث کرش نشه.
-        """
-        try:
-            if hit_429:
-                self._consecutive_rate_limit_hits += 1
-                now = time.time()
-                self._last_rate_limit_hit_ts = now
-                if (self._consecutive_rate_limit_hits >= self.RATE_LIMIT_ALERT_THRESHOLD
-                        and (now - self._last_rate_limit_alert_ts) >= self.RATE_LIMIT_ALERT_COOLDOWN_SECONDS):
-                    self._rate_limit_alert_sent = True
-                    self._last_rate_limit_alert_ts = now
-                    if self.on_quota_exhausted_callback:
-                        rem_req = self.quota.remaining_requests
-                        rem_tok = self.quota.remaining_tokens
-                        try:
-                            self.on_quota_exhausted_callback(
-                                f"⚠️ هوش مصنوعی (Groq) به سقف نرخ/سهمیه خورده و چند بار پیاپی پاسخ 429 داده (آخرین نماد: {label}).\n\n"
-                                f"باقیمانده طبق هدرها: {rem_req if rem_req is not None else '؟'} درخواست / "
-                                f"{rem_tok if rem_tok is not None else '؟'} توکن (عدد توکن سقف هر دقیقه‌ست، نه روزانه)\n\n"
-                                "تا برگشتن وضعیت عادی:\n"
-                                "• تنظیم پارامتر دوره‌ای انجام نمی‌شه (پارامترهای قبلی حفظ می‌شن)\n"
-                                "• لایه‌ی قضاوت هم ممکنه سیگنال‌ها رو رد کنه (تایید AI الزامیه)\n\n"
-                                "اگه این پیام ساعت‌ها تکرار شد، مصرف روزانه‌ی کلید Groq رو تو کنسولش چک کن."
-                            )
-                        except Exception:
-                            pass
-            else:
-                self._consecutive_rate_limit_hits = 0
-                if self._rate_limit_alert_sent:
-                    self._rate_limit_alert_sent = False
-                    if self.on_quota_exhausted_callback:
-                        try:
-                            self.on_quota_exhausted_callback(
-                                "✅ هوش مصنوعی (Groq) دوباره پاسخ عادی می‌ده - سقف نرخ برداشته شد و "
-                                "تنظیم پارامتر و لایه‌ی قضاوت به حالت عادی برگشتن."
-                            )
-                        except Exception:
-                            pass
-        except Exception:
-            pass
-
     def _post_with_retry(self, url: str, payload: dict, headers: dict, timeout: int, label: str) -> Optional[requests.Response]:
         for attempt in range(self.MAX_RETRIES_429 + 1):
             self._wait_for_groq_slot()
@@ -542,11 +472,9 @@ class AIParameterOptimizer:
             self.quota.update_from_headers(response.headers)
 
             if response.status_code != 429:
-                self._register_rate_limit_result(False, label)
                 return response
 
             if attempt >= self.MAX_RETRIES_429:
-                self._register_rate_limit_result(True, label)
                 return response
 
             retry_after = response.headers.get("Retry-After") or response.headers.get("retry-after")
@@ -567,23 +495,10 @@ class AIParameterOptimizer:
                         f"(باقیمانده: {self.quota.remaining_requests} درخواست / {self.quota.remaining_tokens} توکن) - "
                         f"سهمیه برای لایه‌ی قضاوت معامله نگه داشته می‌شه.")
             return False
-
-        # بعد از یه 429 نهایی، چند ثانیه بهینه‌سازی رو نگه می‌داریم تا جا برای لایه‌ی قضاوت بمونه
-        if time.time() - self._last_rate_limit_hit_ts < self.OPTIMIZER_PAUSE_AFTER_429_SECONDS:
-            return False
-
-        # پخش بهینه‌سازی‌ها: بین دو بهینه‌سازی حداقل MIN_SECONDS_BETWEEN_OPTIMIZATIONS ثانیه فاصله
-        if time.time() - self._last_optimization_start_ts < self.MIN_SECONDS_BETWEEN_OPTIMIZATIONS:
-            return False
-
         state = self.symbol_states[symbol]
         if state["last_optimized_time"] is None:
-            self._last_optimization_start_ts = time.time()
             return True
-        if datetime.now() - state["last_optimized_time"] >= self.optimization_interval:
-            self._last_optimization_start_ts = time.time()
-            return True
-        return False
+        return datetime.now() - state["last_optimized_time"] >= self.optimization_interval
 
     def optimize_symbol_parameters(self, symbol: str, df_15m: pd.DataFrame, journal=None):
         if not self.groq_api_key or df_15m.empty:
@@ -2113,4 +2028,66 @@ class RenderSignalSystem:
 
     def run_once(self):
         logger.info("----- شروع آنالیز ایمن و ضد ضرر بازار -----")
-        self._
+        self._check_daily_rollover()
+
+        if self.correlation_manager.should_refresh():
+            self.correlation_manager.refresh()
+
+        macro_context = self._build_macro_context()
+        # چک سقف ضرر ۸٪ / قفل سود ۲٪ و تصمیم‌های AI مرتبط
+        try:
+            self.daily_guard.update_and_act(macro_context)
+        except Exception as e:
+            logger.error(f"خطا در daily_guard (ادامه بدون کرش): {e}")
+
+        fetch_failures = 0
+        for symbol in self.config.SYMBOLS:
+            ok = self.process_symbol(symbol, macro_context)
+            if not ok:
+                fetch_failures += 1
+            time.sleep(1.5)
+
+        if fetch_failures == len(self.config.SYMBOLS):
+            self.consecutive_full_cycle_failures += 1
+        else:
+            self.consecutive_full_cycle_failures = 0
+            self.data_outage_alert_sent = False
+
+        if self.consecutive_full_cycle_failures >= 2 and not self.data_outage_alert_sent:
+            self._send_crash_alert(
+                "دریافت داده برای همه‌ی نمادها در چند چرخه‌ی متوالی ناموفق بود - "
+                "احتمالاً اتصال صرافی/اینترنت مشکل داره. ربات به تلاش ادامه می‌ده."
+            )
+            self.data_outage_alert_sent = True
+
+    def run_loop(self):
+        global _global_system
+        _global_system = self
+
+        logger.info("بخش رندر (Render Signal Generator) با موفقیت فعال شد.")
+        threading.Thread(target=verify_and_notify_startup, args=(self.config,), daemon=True).start()
+        threading.Thread(target=self._telegram_updates_loop, daemon=True, name="TelegramCallbacks").start()
+
+        while self.running:
+            try:
+                self.run_once()
+            except Exception as e:
+                logger.error(f"خطای پیش‌بینی‌نشده در چرخه‌ی اصلی: {e}")
+                self._send_crash_alert(
+                    f"خطای پیش‌بینی‌نشده در چرخه‌ی اصلی ربات:\n`{e}`\n\n"
+                    "ربات همچنان روشنه و چرخه‌ی بعدی رو امتحان می‌کنه."
+                )
+            gc.collect()
+            logger.info(f"پایان چرخه بررسی بازار. انتظار برای دور بعدی ({self.config.CHECK_INTERVAL} ثانیه)...")
+            time.sleep(self.config.CHECK_INTERVAL)
+
+    def stop(self):
+        self.running = False
+        logger.info("بخش رندر متوقف شد.")
+
+if __name__ == "__main__":
+    system = RenderSignalSystem()
+    try:
+        system.run_loop()
+    except KeyboardInterrupt:
+        system.stop()
