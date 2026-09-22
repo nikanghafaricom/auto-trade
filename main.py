@@ -1,12 +1,10 @@
 # ==============================================
-# Hybrid Signal Bot - نسخه حرفه‌ای (Anti-Loss + Risk Management + Market Structure)
-# اصول به‌کاررفته: ریسک ثابت درصدی، محدودیت اکسپوژر همبسته،
-# ساختار بازار، تایید چندتایم‌فریمی، فیلتر رژیم نوسان، تریلینگ استاپ واقعی، ژورنال معاملات
+# Hybrid Signal Bot - نسخه رندر (Render: دریافت، تحلیل، ارسال به کانال و همروش)
+# نسخه نهایی هم‌راستا با کد ۱ در تصمیم‌گیری + بدون معامله مجازی
 # ==============================================
 import os
 import time
 import logging
-import requests
 import gc
 import json
 import threading
@@ -15,35 +13,10 @@ from datetime import datetime, timedelta, date as date_cls
 from typing import Dict, Optional, List, Tuple
 import pandas as pd
 import ccxt
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
-
-# ==================== وب‌سرور استاندارد ====================
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/html; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"Anti-Loss Bot is alive and running at Peak Performance!")
-
-    def do_HEAD(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/html; charset=utf-8")
-        self.end_headers()
-
-    def log_message(self, format, *args):
-        return
-
-def start_health_check_server():
-    port = int(os.environ.get("PORT", 10000))
-    try:
-        server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-        server.serve_forever()
-    except Exception as e:
-        logger.error(f"خطا در اجرای وب‌سرور: {e}")
-
-threading.Thread(target=start_health_check_server, daemon=True).start()
 
 # ==================== تنظیمات ====================
 class Config:
@@ -52,11 +25,11 @@ class Config:
     SECRET = os.getenv("EXCHANGE_SECRET", "")
     PASSWORD = os.getenv("EXCHANGE_PASSWORD", "")
 
-    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-    PERSONAL_CHAT_ID = os.getenv("PERSONAL_CHAT_ID")
-
-    GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "")    # مخصوص کانال (سیگنال‌های خام)
+    TELEGRAM_PERSONAL_ID = os.getenv("TELEGRAM_PERSONAL_ID", "") # مخصوص پی‌وی (نتیجه معاملات)
+    HAMRAVESH_WEBHOOK_URL = os.getenv("HAMRAVESH_WEBHOOK_URL", "")
+    SECRET_TOKEN = os.getenv("SECRET_TOKEN", "")
 
     SYMBOLS = [
         "BTC/USDT",
@@ -89,116 +62,54 @@ class Config:
     }
 
     ENTRY_TIMEFRAME = "15m"
-    CONFIRM_TIMEFRAME = "1h"
     TREND_TIMEFRAME = "4h"
-    CHECK_INTERVAL = 300
+    CHECK_INTERVAL = 300  # هر ۵ دقیقه یک‌بار
 
+    # ---- تنظیمات لایه‌ی تحلیل و سیگنال (عین کد ۱) ----
+    GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+    CONFIRM_TIMEFRAME = "1h"
     MIN_SIGNAL_SCORE = 7.5
     ATR_PERCENTILE_MAX = 97
-
+    MIN_JUDGE_CONFIDENCE = int(os.getenv("MIN_JUDGE_CONFIDENCE", 55))
+    # فقط برای محاسبه‌ی «پیشنهاد حجم» داخل پیام سیگنال
     VIRTUAL_CAPITAL_USDT = float(os.getenv("VIRTUAL_CAPITAL_USDT", 10000))
     RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", 1.5))
+    # تعداد کندل ۴ساعته برای warmup واقعی EMA200
+    TREND_WARMUP_CANDLES = 300
+
+    # ---- مدیریت ریسک و همبستگی (عین کد ۱) ----
     MAX_CONCURRENT_TRADES = int(os.getenv("MAX_CONCURRENT_TRADES", 4))
     MAX_TRADES_PER_GROUP = int(os.getenv("MAX_TRADES_PER_GROUP", 2))
-
-    MIN_JUDGE_CONFIDENCE = int(os.getenv("MIN_JUDGE_CONFIDENCE", 55))
-
-    # ---- کارمزد و اسلیپیج (برای مدل‌سازی واقعی‌تر PnL در PaperTrader) ----
-    # کارمزد هر طرف فعلاً روی صفر ست شده چون عدد دقیق Coinex رو خودت بعداً وارد می‌کنی؛
-    # همین که عدد واقعی رو گرفتی کافیه همین متغیر محیطی رو ست کنی، چیز دیگه‌ای لازم نیست عوض بشه
     EXCHANGE_TAKER_FEE_PCT = float(os.getenv("EXCHANGE_TAKER_FEE_PCT", 0.0))
-    # اگه اسپرد لحظه‌ای زمان ورود در دسترس نبود (fetch_spread_pct ناموفق بود)، این
-    # مقدار پیش‌فرض به‌جاش استفاده می‌شه (نصفش به‌عنوان اسلیپیج هر طرف حساب می‌شه)
     DEFAULT_SPREAD_PCT_FALLBACK = 0.05
-
-    # ---- مانیتورینگ لحظه‌ای معاملات باز (مستقل و موازی با چرخه‌ی اصلی سیگنال‌گیری) ----
-    TRADE_MONITOR_INTERVAL_SECONDS = int(os.getenv("TRADE_MONITOR_INTERVAL_SECONDS", 30))
-
-    # ---- ماتریس همبستگی داینامیک (جایگزین گروه‌بندی ثابت SYMBOL_GROUPS در تصمیم ریسک) ----
     CORRELATION_LOOKBACK_CANDLES = 100
     CORRELATION_REFRESH_HOURS = 1
-    # آستانه‌ی همبستگی عمداً یک عدد ثابت نیست: بین این دو مرز، بر اساس پرسنتایل نوسان
-    # لحظه‌ای بیت‌کوین (همون پروکسی استرس بازار که قبلاً برای مدیریت حجم استفاده می‌شد)
-    # نوسان می‌کنه - نزدیک MIN وقتی بازار پراسترسه (سخت‌گیرتر روی اکسپوژر همبسته، چون
-    # همبستگی بین آلت‌کوین‌ها در ریزش‌های همگانی به‌شدت بالا می‌ره)، نزدیک MAX وقتی بازار
-    # آرومه. این کار بدون فراخوانی اضافه‌ی هوش مصنوعی/Groq انجام می‌شه - از همون داده‌ی
-    # نوسان لحظه‌ای که هر چرخه محاسبه می‌شه استفاده می‌کنه، پس مصرف پلن رایگان Groq رو
-    # بالا نمی‌بره.
     CORRELATION_THRESHOLD_MIN = 0.6
     CORRELATION_THRESHOLD_MAX = 0.8
     MAX_CORRELATED_TRADES = int(os.getenv("MAX_CORRELATED_TRADES", 2))
 
-    # تعداد کندلی که برای تایم‌فریم روند (4h) می‌گیریم. قبلاً روی پیش‌فرض fetch_ohlcv (۱۵۰)
-    # حساب می‌شد که برای warmup واقعی EMA با span=200 ناکافیه (EMA اولیه‌هاش هنوز به مقدار
-    # واقعی نرسیده). با ۳۰۰ کندلِ ۴ساعته (۵۰ روز تاریخچه) EMA200 عملاً converge می‌شه.
-    TREND_WARMUP_CANDLES = 300
+    # ---- محافظت روزانه سود/ضرر (دوره ۲۴ ساعته از ساعت ثابت) ----
+    PERIOD_RESET_HOUR = int(os.getenv("PERIOD_RESET_HOUR", 0))  # 0 = نیمه‌شب سرور
+    DAILY_HARD_LOSS_PCT = float(os.getenv("DAILY_HARD_LOSS_PCT", 8.0))
+    DAILY_PROFIT_LOCK_PCT = float(os.getenv("DAILY_PROFIT_LOCK_PCT", 2.0))
+    PROFIT_AI_WAIT_MINUTES = int(os.getenv("PROFIT_AI_WAIT_MINUTES", 45))
 
     def validate(self):
-        required = {
-            "TELEGRAM_BOT_TOKEN": self.TELEGRAM_BOT_TOKEN,
-            "TELEGRAM_CHAT_ID": self.TELEGRAM_CHAT_ID,
-        }
-        missing = [key for key, value in required.items() if not value]
-        if missing:
-            raise ValueError(f"این متغیرهای محیطی تنظیم نشدن: {', '.join(missing)}")
+        if not self.TELEGRAM_BOT_TOKEN or (not self.TELEGRAM_CHANNEL_ID and not self.TELEGRAM_PERSONAL_ID):
+            logger.warning("هشدار: توکن یا آیدی‌های تلگرام به درستی تنظیم نشده‌اند.")
 
 # ==================== لاگ ====================
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
     handlers=[
-        logging.FileHandler("trading_signals.log", encoding='utf-8'),
+        logging.FileHandler("render_bot.log", encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
-# ==================== لایه داده ====================
-class DataLayer:
-    def __init__(self, config: Config):
-        self.config = config
-        exchange_class = getattr(ccxt, config.EXCHANGE_ID)
-        self.exchange = exchange_class({
-            'apiKey': config.API_KEY,
-            'secret': config.SECRET,
-            'enableRateLimit': True,
-            'options': {'defaultType': 'spot'}
-        })
-
-    def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 150) -> pd.DataFrame:
-        try:
-            ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            return df
-        except Exception as e:
-            logger.error(f"خطا در دریافت داده {symbol} در تایم‌فریم {timeframe}: {e}")
-            return pd.DataFrame()
-
-    def fetch_funding_rate(self, symbol: str) -> Optional[float]:
-        try:
-            funding_symbol = symbol.replace("/USDT", "/USDT:USDT")
-            data = self.exchange.fetch_funding_rate(funding_symbol)
-            rate = data.get("fundingRate") if data else None
-            return float(rate) if rate is not None else None
-        except Exception:
-            return None
-
-    def fetch_spread_pct(self, symbol: str) -> Optional[float]:
-        try:
-            ob = self.exchange.fetch_order_book(symbol, limit=5)
-            best_bid = ob['bids'][0][0] if ob.get('bids') else None
-            best_ask = ob['asks'][0][0] if ob.get('asks') else None
-            if not best_bid or not best_ask:
-                return None
-            mid = (best_bid + best_ask) / 2
-            if mid <= 0:
-                return None
-            return float((best_ask - best_bid) / mid * 100)
-        except Exception:
-            return None
-
-# ==================== منابع داده‌ی کلان/فرابازاری (مستقل از هر ارز خاص) ====================
+# ==================== منابع داده‌ی کلان/فرابازاری ====================
 class MacroDataLayer:
     def __init__(self):
         self._fng_value: Optional[int] = None
@@ -326,30 +237,14 @@ class AnalysisLayer:
 # ==================== ردیاب سهمیه‌ی رایگان Groq ====================
 class GroqQuotaTracker:
     """
-    سقف‌های واقعیِ پلن رایگان Groq برای مدل openai/gpt-oss-120b (بررسی‌شده از
-    console.groq.com/docs/rate-limits، سپتامبر ۲۰۲۶): ۳۰ درخواست/دقیقه،
-    ۱٬۰۰۰ درخواست/روز، ۸٬۰۰۰ توکن/دقیقه، ۲۰۰٬۰۰۰ توکن/روز - این سقف‌ها برای
-    کل سازمان مشترکه (نه هر تابع/کاربر جداگانه).
+    سقف‌های واقعیِ پلن رایگان Groq برای مدل openai/gpt-oss-120b: ۳۰ درخواست/دقیقه،
+    ۱٬۰۰۰ درخواست/روز، ۸٬۰۰۰ توکن/دقیقه، ۲۰۰٬۰۰۰ توکن/روز.
 
-    نکته‌ی مهم درباره‌ی هدرهای Groq: طبق خودِ مستندات رسمی‌شون،
-    x-ratelimit-remaining-requests همیشه به سقف روزانه (RPD=1000) اشاره داره،
-    ولی x-ratelimit-remaining-tokens همیشه به سقف هر-دقیقه (TPM=8000) اشاره
-    داره، نه به یه بودجه‌ی روزانه‌ی توکن. یعنی این عدد هر دقیقه خودش دوباره
-    شارژ می‌شه و مقایسه‌ش با آستانه‌های بزرگ (نزدیک یا بالاتر از ۸۰۰۰) عملاً
-    همیشه false می‌شه. به همین خاطر آستانه‌های توکن پایین‌تر از سقف واقعی
-    TPM=8000 نگه داشته می‌شن - نه به‌عنوان یه بودجه‌ی روزانه، بلکه صرفاً برای
-    اینکه اگه توی همون دقیقه‌ی جاری فشار زیادی روی TPM هست، تنظیم پارامتر
-    (که اهمیت کمتری داره) عقب بکشه و جا برای لایه‌ی قضاوت باز بمونه.
+    به‌جای شمارش دستی مصرف، از خودِ هدرهای x-ratelimit-remaining-* که Groq بعد از
+    هر پاسخ برمی‌گردونه استفاده می‌کنیم.
 
-    به‌جای شمارش دستی مصرف (که با ساعت ریست واقعی سرور Groq هماهنگ نیست)، از
-    خودِ هدرهای x-ratelimit-remaining-* که Groq بعد از هر پاسخ برمی‌گردونه
-    استفاده می‌کنیم - دقیق‌تره و خودش با ریست واقعی سهمیه هماهنگه.
-
-    اولویت‌بندی: لایه‌ی قضاوت معامله (evaluate_trade_candidate) روی تصمیم واقعی
-    معامله اثر می‌ذاره، پس آستانه‌ی توقفش خیلی پایین‌تره (تقریباً تا آخرین لحظه
-    ادامه می‌ده). تنظیم پارامتر دوره‌ای (optimize_symbol_parameters) صرفاً
-    بهینه‌سازیه، پس با آستانه‌ی محافظه‌کارتر زودتر متوقف می‌شه تا سهمیه برای
-    لایه‌ی قضاوت باقی بمونه.
+    اولویت‌بندی: لایه‌ی قضاوت معامله آستانه‌ی توقف خیلی پایین‌تری داره؛ تنظیم پارامتر
+    دوره‌ای با آستانه‌ی محافظه‌کارتر زودتر متوقف می‌شه تا سهمیه برای قضاوت بمونه.
     """
     def __init__(self):
         self.remaining_requests: Optional[int] = None
@@ -396,30 +291,20 @@ class AIParameterOptimizer:
         self.MAX_RETRIES_429 = 2
         self.MAX_BACKOFF_SECONDS = 8
 
-        # نکته‌ی مهم بعد از بررسی سقف‌های واقعی Groq: مصرف این بات معمولاً حدود
-        # ۵۰۰-۷۰۰ توکن در هر فراخوانیه (پرامپت + پاسخ)، نه چند ده توکن. با سقف واقعی
-        # ۸٬۰۰۰ توکن/دقیقه، حتی ۲۵ درخواست در دقیقه (تنظیم قبلی) می‌تونست به ۱۵-۲۰
-        # هزار توکن در دقیقه برسه و زودتر از حد درخواست، به سقف توکن بخوره. عدد پایین‌تر
-        # اینجا بر همین اساس (نه فقط سقف تعداد درخواست) انتخاب شده.
+        # مصرف این بات معمولاً حدود ۵۰۰-۷۰۰ توکن در هر فراخوانیه؛ با سقف ۸٬۰۰۰ توکن/دقیقه
+        # عدد پایین‌تری برای درخواست/دقیقه انتخاب شده
         self.GROQ_TARGET_RPM = 10
         self.groq_min_interval_seconds = 60.0 / self.GROQ_TARGET_RPM
         self._last_groq_call_ts = 0.0
         # ردیاب سهمیه‌ی رایگان - بعد از هر پاسخ Groq با هدرهای واقعی خودش به‌روز می‌شه
         self.quota = GroqQuotaTracker()
-        # این کالبک از بیرون (HybridTradingSystem) ست می‌شه تا وقتی سهمیه تموم/برگردوند
-        # شد، بتونیم یه پیام تلگرام بفرستیم - خودِ این کلاس دسترسی مستقیم به تلگرام نداره
+        # این کالبک از بیرون ست می‌شه تا وقتی سهمیه تموم/برگشت یا اتصال قطع/برقرار شد،
+        # پیام تلگرام بفرستیم
         self.on_quota_exhausted_callback: Optional[callable] = None
         self._judge_quota_alert_sent = False
-        # هشدار خطای عمومی لایه‌ی قضاوت (پاسخ غیرمنتظره/غیر-JSON از Groq که ربطی به
-        # تمومشدن سهمیه یا قطعی شبکه نداره - مثل خالی‌بودن بدنه‌ی پاسخ). قبلاً این حالت
-        # فقط لاگ می‌شد و پیام تلگرام نمی‌رفت.
         self._judge_error_alert_sent = False
 
         # ---- تشخیص قطعی/برقراری اتصال شبکه‌ای به Groq (جدا از تمومشدن سهمیه) ----
-        # این بخش مخصوص حالتیه که خودِ درخواست به Groq اصلاً به پاسخ نمی‌رسه (قطعی
-        # اینترنت، DNS، timeout و مثل اون‌ها)، نه حالت 429/تمومشدن سهمیه که جدا از این
-        # با GroqQuotaTracker مدیریت می‌شه. بعد از چند شکست پیاپی یه هشدار به تلگرام
-        # می‌فرسته و وقتی دوباره یه پاسخ موفق بگیره، پیام «برقرار شد» رو می‌فرسته.
         self.CONNECTION_FAILURE_ALERT_THRESHOLD = 3
         self._consecutive_connection_failures = 0
         self._connection_alert_sent = False
@@ -466,13 +351,8 @@ class AIParameterOptimizer:
                 "consecutive_losses": 0,
                 "params": self.validate_and_clamp_params(merged_params)
             }
-        # محاسبه‌ی مصرف واقعی: هر فراخوانی تنظیم پارامتر حدود ۵۵۰-۷۵۰ توکن مصرف می‌کنه.
-        # با ۱۲ ارز، هر ۱ ساعت یک‌بار یعنی ۲۸۸ فراخوانی در روز × ~۷۰۰ توکن ≈ ۲۰۱٬۰۰۰
-        # توکن در روز - یعنی به‌تنهایی کل سهمیه‌ی روزانه‌ی ۲۰۰٬۰۰۰ توکنی Groq رو مصرف
-        # می‌کنه و چیزی برای لایه‌ی قضاوت معامله (که مهم‌تره) باقی نمی‌ذاره. با فاصله‌ی
-        # ۲ ساعت، مصرف این بخش به ~۱۰۰٬۰۰۰ توکن/روز (نصف سهمیه) می‌رسه و باقی برای
-        # قضاوت معامله + حاشیه‌ی امن می‌مونه. GroqQuotaTracker علاوه بر این، اگه مصرف
-        # واقعی از این تخمین بیشتر شد، خودش به‌صورت پویا این بخش رو محدودتر می‌کنه.
+        # هر فراخوانی تنظیم پارامتر حدود ۷۰۰ توکن مصرف می‌کنه؛ با فاصله‌ی ۲ ساعت، مصرف این
+        # بخش حدود نصف سهمیه‌ی روزانه می‌شه و باقی برای لایه‌ی قضاوت می‌مونه
         self.optimization_interval = timedelta(hours=2)
 
     def is_blacklisted(self, symbol: str, current_pctl: Optional[float] = None) -> bool:
@@ -545,11 +425,9 @@ class AIParameterOptimizer:
 
     def _register_connection_result(self, success: bool, label: str):
         """
-        ثبت نتیجه‌ی «اتصال شبکه‌ای» واقعی به Groq (نه وضعیت HTTP مثل 429). با هر پاسخ
-        موفق (حتی اگه بعداً به‌خاطر سهمیه یا خطای دیگه رد بشه) success=True حساب می‌شه؛
-        فقط وقتی خودِ درخواست اصلاً به پاسخ نمی‌رسه (Timeout/ConnectionError و مثل اون‌ها)
-        success=False می‌شه. بعد از چند شکست پیاپی هشدار «قطع اتصال» و به‌محض اولین
-        موفقیت بعد از اون، پیام «اتصال برقرار شد» به تلگرام فرستاده می‌شه.
+        ثبت نتیجه‌ی «اتصال شبکه‌ای» واقعی به Groq (نه وضعیت HTTP مثل 429). بعد از چند
+        شکست پیاپی هشدار «قطع اتصال» و به‌محض اولین موفقیت بعد از اون، پیام «اتصال
+        برقرار شد» به تلگرام فرستاده می‌شه.
         """
         if success:
             self._consecutive_connection_failures = 0
@@ -622,7 +500,7 @@ class AIParameterOptimizer:
             return True
         return datetime.now() - state["last_optimized_time"] >= self.optimization_interval
 
-    def optimize_symbol_parameters(self, symbol: str, df_15m: pd.DataFrame, journal: Optional["TradeJournal"] = None):
+    def optimize_symbol_parameters(self, symbol: str, df_15m: pd.DataFrame, journal=None):
         if not self.groq_api_key or df_15m.empty:
             return
 
@@ -681,13 +559,7 @@ No markdown formatting, no extra text.
             "model": "openai/gpt-oss-120b",
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2,
-            # ریزنینگ سبک: مدل هنوز کمی فکر می‌کنه ولی توکن کمتری صرف reasoning داخلی
-            # می‌کنه، پس فضای بیشتری برای خودِ خروجی JSON باقی می‌مونه (رفع خطای
-            # Expecting value: line 1 column 1 که به‌خاطر خالی‌موندن content رخ می‌داد)
             "reasoning_effort": "low",
-            # سقف طول پاسخ - از ۳۰۰ به ۶۰۰ افزایش یافت تا حتی با کمی توکن reasoning،
-            # جای کافی برای خروجی کامل ۱۴ پارامتر JSON بمونه. این عدد سقفه، نه مصرف
-            # تضمینی - با reasoning_effort=low مصرف واقعی معمولاً نزدیک قبل می‌مونه.
             "max_tokens": 600
         }
 
@@ -717,8 +589,7 @@ No markdown formatting, no extra text.
 
     def _alert_judge_error(self, message: str):
         """هشدار خطای عمومی لایه‌ی قضاوت (پاسخ 200 اما غیرمنتظره/غیر-JSON، یا هر خطای
-        دیگری که مربوط به تمومشدن سهمیه یا قطعی شبکه نیست). قبلاً این حالت فقط لاگ
-        می‌شد و به تلگرام اطلاع داده نمی‌شد."""
+        دیگری که مربوط به تمومشدن سهمیه یا قطعی شبکه نیست)."""
         if not self._judge_error_alert_sent:
             self._judge_error_alert_sent = True
             if self.on_quota_exhausted_callback:
@@ -737,9 +608,8 @@ No markdown formatting, no extra text.
                     pass
 
     def evaluate_trade_candidate(self, symbol: str, side: str, context: dict) -> Dict:
-        # طبق درخواست کاربر: لایه‌ی قضاوت AI الزامیه. اگه به هر دلیلی (نبود کلید، تمومشدن
-        # سهمیه، قطعی شبکه، پاسخ نامعتبر) به AI دسترسی نباشه، سیگنال رد می‌شه - نه اینکه
-        # با تایید پیش‌فرض قبول بشه.
+        # لایه‌ی قضاوت AI الزامیه. اگه به هر دلیلی (نبود کلید، تمومشدن سهمیه، قطعی شبکه،
+        # پاسخ نامعتبر) به AI دسترسی نباشه، سیگنال رد می‌شه.
         default = {"approve": False, "confidence": 0, "reason": "بدون دسترسی به AI - طبق تنظیم، سیگنال رد شد (تایید AI الزامیه)"}
         if not self.groq_api_key:
             return default
@@ -755,10 +625,6 @@ No markdown formatting, no extra text.
                     except Exception:
                         pass
         else:
-            # سهمیه تموم شده: به‌جای رد کردن سیگنال، بات فقط بر پایه‌ی امتیاز کمی
-            # (که خودش قبلاً از فیلترهای سخت‌گیرانه رد شده) ادامه می‌ده - یعنی دقیقاً
-            # مثل وقتی که اصلاً کلید Groq تنظیم نشده. کار بات متوقف نمی‌شه، فقط یک
-            # لایه‌ی محافظتی اضافه (نظر AI) موقتاً غیرفعاله.
             if not self._judge_quota_alert_sent:
                 self._judge_quota_alert_sent = True
                 if self.on_quota_exhausted_callback:
@@ -804,11 +670,7 @@ Respond ONLY with valid JSON, no markdown, no extra text, in exactly this shape:
             "model": "openai/gpt-oss-120b",
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.3,
-            # ریزنینگ سبک: مصرف توکن reasoning داخلی رو کم می‌کنه تا خروجی JSON نهایی
-            # همیشه فضای کافی برای تولید کامل داشته باشه (رفع همون خطای پاسخ خالی)
             "reasoning_effort": "low",
-            # سقف طول پاسخ - از ۲۰۰ به ۵۰۰ افزایش یافت؛ چون این لایه (تایید نهایی
-            # معامله) الزامیه، نباید به‌خاطر کمبود سقف توکن، بدون دلیل واقعی رد بشه
             "max_tokens": 500
         }
         try:
@@ -1022,22 +884,54 @@ class SignalEngine:
 
         return None, {}
 
+    def calculate_trade_levels(self, symbol: str, side: str, latest: pd.Series, macro_context: Optional[dict] = None) -> dict:
+        """محاسبه‌ی قیمت ورود، حد ضرر، تارگت‌ها و پیشنهاد حجم - عین منطق کد ۱."""
+        price = float(latest['close'])
+        atr = float(latest['atr']) if not pd.isna(latest['atr']) else price * 0.01
+
+        p = self.ai_optimizer.get_params(symbol)
+
+        if side == "BUY":
+            stop_loss = min(float(latest['support']), price - (p["sl_atr_mult"] * atr))
+            risk = price - stop_loss
+            tp1 = round(price + (p["tp1_mult"] * risk), 4)
+            tp2 = round(price + (p["tp2_mult"] * risk), 4)
+            tp3 = round(price + (p["tp3_mult"] * risk), 4)
+            stop_loss = round(stop_loss, 4)
+        else:
+            stop_loss = max(float(latest['resistance']), price + (p["sl_atr_mult"] * atr))
+            risk = stop_loss - price
+            tp1 = round(price - (p["tp1_mult"] * risk), 4)
+            tp2 = round(price - (p["tp2_mult"] * risk), 4)
+            tp3 = round(price - (p["tp3_mult"] * risk), 4)
+            stop_loss = round(stop_loss, 4)
+
+        btc_volatility_pctl = (macro_context or {}).get("btc_volatility_pctl")
+        stress_active = btc_volatility_pctl is not None and btc_volatility_pctl >= p["stress_pctl_threshold"]
+        size_mult = p["stress_size_mult"] if stress_active else 1.0
+
+        risk_amount = self.config.VIRTUAL_CAPITAL_USDT * (self.config.RISK_PER_TRADE_PCT / 100) * size_mult
+        risk_per_unit = abs(price - stop_loss)
+        qty = (risk_amount / risk_per_unit) if risk_per_unit > 0 else 0.0
+
+        return {
+            "price": price, "tp1": tp1, "tp2": tp2, "tp3": tp3, "sl": stop_loss,
+            "qty": qty, "notional": qty * price, "atr": atr,
+            "rr_ratio": p["tp1_mult"],
+            "stress_active": stress_active, "size_mult": size_mult,
+            "btc_volatility_pctl": btc_volatility_pctl
+        }
+
 # ==================== ماتریس همبستگی داینامیک ====================
 class CorrelationManager:
     """
     جایگزین گروه‌بندی ثابت SYMBOL_GROUPS برای تصمیم اکسپوژر همبسته. هر
-    CORRELATION_REFRESH_HOURS یک‌بار، همبستگی بازدهی (return) نمادها روی
-    تایم‌فریم ورودی بازمحاسبه می‌شه. آستانه‌ی همبستگی خودش ثابت نیست: بین
-    CORRELATION_THRESHOLD_MIN (در استرس بازار) تا CORRELATION_THRESHOLD_MAX
-    (در آرامش بازار) بر اساس همون پرسنتایل نوسان لحظه‌ای بیت‌کوین که قبلاً
-    برای مدیریت حجم پوزیشن هم استفاده می‌شد، حرکت می‌کنه - چون در ریزش‌های
-    همگانی همبستگی بین آلت‌کوین‌ها معمولاً به‌شدت بالا می‌ره و یه آستانه‌ی
-    ثابت اون شرایط رو نمی‌بینه. عمداً بدون فراخوانی اضافه‌ی Groq پیاده‌سازی
-    شده تا مصرف پلن رایگانش بالا نره.
-    در نبود داده‌ی کافی (هنوز محاسبه نشده یا نماد در ماتریس نیست)، به‌طور
-    ایمن به گروه‌بندی ثابت قبلی برمی‌گرده.
+    CORRELATION_REFRESH_HOURS یک‌بار، همبستگی بازدهی نمادها روی تایم‌فریم ورودی
+    بازمحاسبه می‌شه. آستانه‌ی همبستگی بین MIN (در استرس بازار) تا MAX (در آرامش بازار)
+    بر اساس پرسنتایل نوسان لحظه‌ای بیت‌کوین حرکت می‌کنه. بدون فراخوانی اضافه‌ی Groq.
+    در نبود داده‌ی کافی، به گروه‌بندی ثابت برمی‌گرده.
     """
-    def __init__(self, config: Config, data_layer: DataLayer):
+    def __init__(self, config: Config, data_layer):
         self.config = config
         self.data = data_layer
         self.matrix: Optional[pd.DataFrame] = None
@@ -1051,7 +945,7 @@ class CorrelationManager:
     def refresh(self):
         closes = {}
         for symbol in self.config.SYMBOLS:
-            df = self.data.fetch_ohlcv(symbol, timeframe=self.config.ENTRY_TIMEFRAME, limit=self.config.CORRELATION_LOOKBACK_CANDLES)
+            df = self.data.fetch_ohlcv_df(symbol, self.config.ENTRY_TIMEFRAME, limit=self.config.CORRELATION_LOOKBACK_CANDLES)
             if df.empty or len(df) < 30:
                 continue
             closes[symbol] = df.set_index('timestamp')['close']
@@ -1091,7 +985,7 @@ class CorrelationManager:
                     count += 1
         return count
 
-# ==================== مدیریت ریسک و سرمایه (روش تریدرهای حرفه‌ای) ====================
+# ==================== مدیریت ریسک و سرمایه ====================
 class RiskManager:
     def __init__(self, config: Config):
         self.config = config
@@ -1105,9 +999,6 @@ class RiskManager:
 
     def can_open_trade(self, symbol: str, active_trades: Dict, correlation_manager: Optional["CorrelationManager"] = None,
                         btc_volatility_pctl: Optional[float] = None) -> Tuple[bool, str]:
-        # توجه: سقف تعداد کل معاملات هم‌زمان (MAX_CONCURRENT_TRADES) که شبیه‌ساز محدودیت
-        # واقعیِ حساب بود، طبق درخواست حذف شد. محدودیت اکسپوژر همبسته (ریسک واقعی، نه
-        # شبیه‌سازی مصنوعی) همچنان برقراره تا چند معامله‌ی هم‌بسته هم‌زمان باز نشه.
         if correlation_manager is not None:
             threshold = correlation_manager.get_dynamic_threshold(btc_volatility_pctl)
             corr_count = correlation_manager.correlated_count(symbol, active_trades, threshold)
@@ -1124,7 +1015,7 @@ class RiskManager:
 
         return True, ""
 
-# ==================== ژورنال معاملات: آمار واقعی Win-rate و Expectancy ====================
+# ==================== ژورنال معاملات (تغذیه از فیدبک واقعی همروش) ====================
 class TradeJournal:
     def __init__(self, path: str = "trade_history.json"):
         self.path = path
@@ -1164,23 +1055,16 @@ class TradeJournal:
         today = date_cls.today().isoformat()
         return sum(r["pnl_usdt"] for r in self.records if r["date"] == today)
 
-    def get_recent_peer_signal(self, peer_symbols: List[str], side: str, lookback_hours: float = 3.0) -> Optional[Dict]:
-        cutoff = datetime.now() - timedelta(hours=lookback_hours)
-        candidates = []
+    def get_realized_pnl_usdt_since(self, since: datetime) -> float:
+        total = 0.0
         for r in self.records:
-            if r["symbol"] not in peer_symbols or r["side"] != side:
-                continue
             try:
                 ts = datetime.fromisoformat(r["timestamp"])
             except Exception:
                 continue
-            if ts >= cutoff:
-                candidates.append((ts, r))
-        if not candidates:
-            return None
-        candidates.sort(key=lambda x: x[0])
-        latest = candidates[-1][1]
-        return {"symbol": latest["symbol"], "r_multiple": latest["r_multiple"], "pnl_usdt": latest["pnl_usdt"]}
+            if ts >= since:
+                total += float(r.get("pnl_usdt") or 0)
+        return total
 
     def get_side_performance(self, symbol: str, side: str, lookback: int = 15) -> Dict:
         side_records = [r for r in self.records if r["symbol"] == symbol and r["side"] == side]
@@ -1238,305 +1122,108 @@ class TradeJournal:
 🔴 **SELL (Short):** {sell_s['count']} رخداد | نرخ برد {sell_s['win_rate']:.1f}% | میانگین R {sell_s['avg_r']:+.2f} | PnL {sell_s['total_pnl']:+.2f} USDT
 """
 
-# ==================== ماژول معامله مجازی: حجم واقعی، پله‌ای، تریلینگ واقعی ====================
-class PaperTrader:
-    def __init__(self, config: Config, telegram_sender, ai_optimizer: AIParameterOptimizer, journal: TradeJournal):
-        self.config = config
-        self.telegram = telegram_sender
-        self.ai_optimizer = ai_optimizer
-        self.journal = journal
-        self.file_path = "paper_trades.json"
-        self.active_trades = self._load_trades()
-        # این قفل لازم شد چون الان دو ترد مجزا (چرخه‌ی اصلی سیگنال‌گیری + ترد مانیتورینگ
-        # لحظه‌ای معاملات باز) هم‌زمان به active_trades دسترسی دارن؛ بدون این قفل، امکان
-        # خطای "dictionary changed size during iteration" یا خراب‌شدن state معاملات باز هست.
+# ==================== ردیاب سبک معاملات باز واقعی (بدون شبیه‌سازی مجازی) ====================
+class ActivePositionsTracker:
+    """
+    فقط وضعیت سیگنال‌هایی که به همروش ارسال شده‌اند را نگه می‌دارد.
+    هیچ مانیتورینگ قیمت، TP/SL مجازی یا محاسبه‌ی PnL مجازی انجام نمی‌دهد.
+    فیدبک واقعی از وب‌هوک close_trade همروش می‌آید.
+    """
+    def __init__(self, path: str = "active_real_positions.json"):
+        self.path = path
         self.lock = threading.Lock()
+        self.positions: Dict[str, dict] = self._load()
 
-    def _load_trades(self) -> Dict:
-        if os.path.exists(self.file_path):
+    def _load(self) -> Dict:
+        if os.path.exists(self.path):
             try:
-                with open(self.file_path, "r", encoding="utf-8") as f:
+                with open(self.path, "r", encoding="utf-8") as f:
                     return json.load(f)
             except Exception:
                 return {}
         return {}
 
-    def _save_trades(self):
+    def _save(self):
         try:
-            with open(self.file_path, "w", encoding="utf-8") as f:
-                json.dump(self.active_trades, f, indent=4)
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self.positions, f, indent=4, ensure_ascii=False)
         except Exception as e:
-            logger.error(f"خطا در ذخیره معاملات مجازی: {e}")
+            logger.error(f"خطا در ذخیره وضعیت معاملات باز واقعی: {e}")
 
-    def snapshot_active_trades(self) -> Dict:
-        """یه کپی امن از معاملات باز برمی‌گردونه - برای خوندن از ترد اصلی، بدون قفل‌کردن طولانی."""
+    def snapshot(self) -> Dict:
         with self.lock:
-            return dict(self.active_trades)
+            return dict(self.positions)
 
-    def get_open_peer_status(self, peer_symbols: List[str], side: str) -> Optional[str]:
+    def mark_open(self, symbol: str, side: str, entry: float, sl: float, tp1: float,
+                  qty: float = 0.0, notional: float = 0.0):
         with self.lock:
-            trades_snapshot = list(self.active_trades.values())
-        for trade in trades_snapshot:
-            if trade.get("symbol") not in peer_symbols or trade.get("side") != side:
-                continue
-            if trade.get("tp1_hit"):
-                return "favorable"
-            entry = trade.get("entry", 0)
-            if not entry:
-                continue
-            if side == "BUY":
-                adverse_pct = (entry - trade.get("lowest_since_entry", entry)) / entry * 100
-            else:
-                adverse_pct = (trade.get("highest_since_entry", entry) - entry) / entry * 100
-            if adverse_pct > 0.5:
-                return "unfavorable"
-        return None
-
-    def get_reference_trade_health(self, reference_symbol: str, recent_hours: float = 3.0) -> Optional[Dict]:
-        with self.lock:
-            open_trades = [t for t in self.active_trades.values() if t['symbol'] == reference_symbol]
-        if open_trades:
-            trade = sorted(open_trades, key=lambda t: t['open_time'])[-1]
-            side = trade['side']
-            entry = trade['entry']
-            original_sl = trade['original_sl']
-            risk = abs(entry - original_sl)
-            if risk <= 0:
-                return None
-            if trade.get('tp1_hit'):
-                return {"side": side, "health": 1.0}
-            if side == "BUY":
-                favorable = trade['highest_since_entry'] - entry
-                unfavorable = entry - trade['lowest_since_entry']
-            else:
-                favorable = entry - trade['lowest_since_entry']
-                unfavorable = trade['highest_since_entry'] - entry
-            health = (favorable - unfavorable) / risk
-            return {"side": side, "health": max(-1.0, min(1.0, health))}
-
-        recent_records = [
-            r for r in self.journal.records
-            if r["symbol"] == reference_symbol
-            and datetime.now() - datetime.fromisoformat(r["timestamp"]) <= timedelta(hours=recent_hours)
-        ]
-        if not recent_records:
-            return None
-        last = sorted(recent_records, key=lambda r: r["timestamp"])[-1]
-        return {"side": last["side"], "health": 1.0 if last["pnl_usdt"] > 0 else -1.0}
-
-    def open_virtual_trade(self, symbol: str, side: str, entry_price: float, tp1: float, tp2: float, tp3: float,
-                            sl: float, qty: float, atr_at_entry: float, spread_pct_at_entry: Optional[float] = None):
-        trade_id = f"{symbol}_{int(time.time())}"
-        with self.lock:
-            self.active_trades[trade_id] = {
+            self.positions[symbol] = {
                 "symbol": symbol,
                 "side": side,
-                "entry": entry_price,
-                "tp1": tp1, "tp2": tp2, "tp3": tp3,
+                "entry": entry,
                 "sl": sl,
                 "original_sl": sl,
+                "tp1": tp1,
                 "qty": qty,
-                "atr_at_entry": atr_at_entry,
-                # اسپرد لحظه‌ای زمان ورود - برای تخمین اسلیپیج واقعی هنگام بستن معامله استفاده می‌شه
-                "spread_pct_at_entry": spread_pct_at_entry,
-                "remaining_pct": 100,
-                "tp1_hit": False,
-                "tp2_hit": False,
-                "highest_since_entry": entry_price,
-                "lowest_since_entry": entry_price,
+                "notional": notional,
                 "open_time": datetime.now().strftime('%Y-%m-%d %H:%M')
             }
-            self._save_trades()
+            self._save()
 
-    def _close_partial(self, trade: Dict, exit_price: float, reason: str, closed_pct: float, register_result: bool = True):
-        side = trade['side']
-        entry = trade['entry']
-        price_diff = (exit_price - entry) if side == "BUY" else (entry - exit_price)
-
-        # مدل‌سازی کارمزد + اسلیپیج واقعی: کارمزد هر طرف (فعلاً پیش‌فرض ۰٪، خودت بعداً
-        # عدد دقیق Coinex رو ست می‌کنی) + نصف اسپرد لحظه‌ای زمان ورود به‌عنوان تخمین
-        # اسلیپیج هر طرف پرشدن سفارش (استاندارد در تخمین هزینه‌ی اجرا). چون اسپرد لحظه‌ای
-        # زمان خروج رو نداریم (برای صرفه‌جویی در تعداد فراخوانی API در مانیتورینگ مکرر)،
-        # از همون اسپرد زمان ورود به‌عنوان تخمین معقول هر دو طرف استفاده می‌شه.
-        spread_estimate_pct = trade.get('spread_pct_at_entry')
-        if spread_estimate_pct is None:
-            spread_estimate_pct = self.config.DEFAULT_SPREAD_PCT_FALLBACK
-        cost_pct_per_side = (self.config.EXCHANGE_TAKER_FEE_PCT + (spread_estimate_pct / 2)) / 100
-        execution_cost_per_unit = (entry + exit_price) * cost_pct_per_side
-        price_diff -= execution_cost_per_unit
-
-        risk_per_unit = abs(entry - trade['original_sl'])
-        r_multiple = (price_diff / risk_per_unit) if risk_per_unit > 0 else 0.0
-        qty_closed = trade['qty'] * (closed_pct / 100)
-        pnl_usdt = price_diff * qty_closed
-        pnl_pct = (price_diff / entry) * 100
-
-        if register_result:
-            if price_diff > 0:
-                self.ai_optimizer.register_win(trade['symbol'])
-            else:
-                self.ai_optimizer.register_loss(trade['symbol'])
-
-        self.journal.record(trade['symbol'], side, reason, pnl_usdt, pnl_pct, r_multiple, closed_pct)
-
-        emoji = "✅" if pnl_usdt > 0 else ("⚪" if pnl_usdt == 0 else "❌")
-        msg = f"""
-{emoji} **گزارش معامله محافظت‌شده**
-
-📌 **ارز:** {trade['symbol']} ({side})
-📎 **علت:** {reason}
-📈 **سود/زیان این مرحله (بعد از کارمزد/اسلیپیج تخمینی):** {pnl_pct:+.2f}% ({pnl_usdt:+.2f} USDT)
-📐 **R Multiple:** {r_multiple:+.2f}R
-📦 **درصد بسته‌شده:** {closed_pct}%
-"""
-        self.telegram.send_personal_message(msg)
-
-    def update_and_check_trades(self, data_layer: DataLayer):
+    def mark_closed(self, symbol: str) -> Optional[dict]:
         with self.lock:
-            if not self.active_trades:
-                return
+            pos = self.positions.pop(symbol, None)
+            if pos is not None:
+                self._save()
+            return pos
 
-            for trade_id, trade in list(self.active_trades.items()):
-                try:
-                    df = data_layer.fetch_ohlcv(trade['symbol'], timeframe="1m", limit=5)
-                    if df.empty:
-                        continue
-                    latest_high = float(df['high'].max())
-                    latest_low = float(df['low'].min())
-                    side = trade['side']
+    def get_reference_trade_health(self, reference_symbol: str, journal: "TradeJournal",
+                                    recent_hours: float = 3.0) -> Optional[Dict]:
+        """سلامت معامله‌ی مرجع بیت‌کوین برای امتیازدهی - از پوزیشن باز واقعی یا ژورنال واقعی."""
+        with self.lock:
+            open_pos = self.positions.get(reference_symbol)
+        if open_pos:
+            # پوزیشن هنوز باز است → health خنثی/مثبت محافظه‌کارانه
+            return {"side": open_pos.get("side", "BUY"), "health": 0.3}
 
-                    trade['highest_since_entry'] = max(trade['highest_since_entry'], latest_high)
-                    trade['lowest_since_entry'] = min(trade['lowest_since_entry'], latest_low)
-
-                    hit_sl = (side == "BUY" and latest_low <= trade['sl']) or (side == "SELL" and latest_high >= trade['sl'])
-                    if hit_sl:
-                        is_breakeven = trade['tp1_hit'] and abs(trade['sl'] - trade['entry']) / trade['entry'] < 0.001
-                        reason = "بسته‌شدن با سود قفل‌شده (Break-even)" if is_breakeven else "برخورد به حد ضرر"
-                        self._close_partial(trade, trade['sl'], reason, trade['remaining_pct'], register_result=not is_breakeven)
-                        del self.active_trades[trade_id]
-                        continue
-
-                    hit_tp3 = (side == "BUY" and latest_high >= trade['tp3']) or (side == "SELL" and latest_low <= trade['tp3'])
-                    if hit_tp3:
-                        self._close_partial(trade, trade['tp3'], "برخورد به TP3 (خروج کامل)", trade['remaining_pct'])
-                        del self.active_trades[trade_id]
-                        continue
-
-                    hit_tp2 = (side == "BUY" and latest_high >= trade['tp2']) or (side == "SELL" and latest_low <= trade['tp2'])
-                    if hit_tp2 and not trade['tp2_hit']:
-                        self._close_partial(trade, trade['tp2'], "برخورد به TP2 (بستن جزئی ۳۰٪)", 30)
-                        trade['remaining_pct'] -= 30
-                        trade['tp2_hit'] = True
-
-                    hit_tp1 = (side == "BUY" and latest_high >= trade['tp1']) or (side == "SELL" and latest_low <= trade['tp1'])
-                    if hit_tp1 and not trade['tp1_hit']:
-                        self._close_partial(trade, trade['tp1'], "برخورد به TP1 (بستن جزئی ۵۰٪ + SL به سر به سر)", 50)
-                        trade['remaining_pct'] -= 50
-                        trade['tp1_hit'] = True
-                        trade['sl'] = trade['entry']
-
-                    if trade['tp1_hit'] and trade['remaining_pct'] > 0:
-                        p = self.ai_optimizer.get_params(trade['symbol'])
-                        atr = trade['atr_at_entry']
-                        if side == "BUY":
-                            new_trail = trade['highest_since_entry'] - (p["trailing_mult"] * atr)
-                            trade['sl'] = max(trade['sl'], round(new_trail, 6))
-                        else:
-                            new_trail = trade['lowest_since_entry'] + (p["trailing_mult"] * atr)
-                            trade['sl'] = min(trade['sl'], round(new_trail, 6))
-
-                    self._save_trades()
-
-                except Exception as e:
-                    logger.error(f"خطا در بررسی معامله مجازی {trade_id}: {e}")
-
-# ==================== ارسال تلگرام ====================
-class TelegramSender:
-    def __init__(self, config: Config, ai_optimizer: AIParameterOptimizer, risk_manager: RiskManager):
-        self.config = config
-        self.ai_optimizer = ai_optimizer
-        self.risk_manager = risk_manager
-        self.base_url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}"
-
-    def test_connection(self) -> bool:
         try:
-            resp = requests.get(f"{self.base_url}/getMe", timeout=10)
-            if resp.status_code == 200 and resp.json().get("ok"):
-                bot_name = resp.json()["result"].get("username", "?")
-                logger.info(f"✅ اتصال تلگرام تایید شد. ربات: @{bot_name}")
-                return True
-            logger.error(f"❌ توکن تلگرام معتبر نیست یا پاسخ غیرمنتظره: {resp.text}")
-            return False
-        except Exception as e:
-            logger.error(f"❌ خطا در تست اتصال تلگرام: {e}")
-            return False
+            recent_records = [
+                r for r in journal.records
+                if r["symbol"] == reference_symbol
+                and datetime.now() - datetime.fromisoformat(r["timestamp"]) <= timedelta(hours=recent_hours)
+            ]
+            if not recent_records:
+                return None
+            last = sorted(recent_records, key=lambda r: r["timestamp"])[-1]
+            return {"side": last["side"], "health": 1.0 if last["pnl_usdt"] > 0 else -1.0}
+        except Exception:
+            return None
 
-    def send_system_status(self, text: str):
+# ==================== ارسال‌کننده پیام به تلگرام ====================
+class TelegramNotifier:
+    @staticmethod
+    def send_to_channel(symbol: str, side: str, latest: pd.Series, trend_4h: str, levels: dict,
+                         judge_reason: str = "", judge_confidence: int = 0):
+        config = Config()
+        if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHANNEL_ID:
+            return True  # کانال تنظیم نشده: مثل قبل، بقیه‌ی مسیر ادامه پیدا می‌کنه
         try:
-            r = requests.post(f"{self.base_url}/sendMessage",
-                               json={"chat_id": self.config.TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
-                               timeout=10)
-            if r.status_code != 200:
-                logger.error(f"ارسال پیام وضعیت ناموفق بود: {r.status_code} {r.text}")
-        except Exception as e:
-            logger.error(f"خطای ارسال پیام به تلگرام: {e}")
+            emoji = "🟢" if side == "BUY" else "🔴"
+            direction = "LONG" if side == "BUY" else "SHORT"
 
-    def send_personal_message(self, text: str):
-        target_id = self.config.PERSONAL_CHAT_ID or self.config.TELEGRAM_CHAT_ID
-        try:
-            r = requests.post(f"{self.base_url}/sendMessage",
-                               json={"chat_id": target_id, "text": text, "parse_mode": "Markdown"},
-                               timeout=10)
-            if r.status_code != 200:
-                logger.error(f"ارسال پیام شخصی ناموفق بود: {r.status_code} {r.text}")
-        except Exception as e:
-            logger.error(f"خطای ارسال پیام شخصی به تلگرام: {e}")
+            price = levels["price"]
+            tp1, tp2, tp3, stop_loss = levels["tp1"], levels["tp2"], levels["tp3"], levels["sl"]
+            qty, notional, rr_ratio = levels["qty"], levels["notional"], levels["rr_ratio"]
 
-    def send_error_alert(self, text: str):
-        """هشدار خطا/کرش - جداگانه از سیگنال‌های معمولی، به چت شخصی ارسال می‌شه تا گم نشه."""
-        self.send_personal_message(f"🚨 **هشدار سیستم** 🚨\n\n{text}")
+            stress_note = ""
+            if levels["stress_active"]:
+                stress_note = f"\n⚠️ **استرس بازار شناسایی شد** (نوسان بیت‌کوین در پرسنتایل {levels['btc_volatility_pctl']:.0f}) - حجم پوزیشن به {levels['size_mult']*100:.0f}٪ حجم عادی کاهش یافت\n"
 
-    def send_signal(self, symbol: str, side: str, latest: pd.Series, trend_4h: str, timeframe: str,
-                     judge_reason: str = "", judge_confidence: int = 0, macro_context: Optional[dict] = None) -> Optional[Dict]:
-        emoji = "🟢" if side == "BUY" else "🔴"
-        direction = "LONG" if side == "BUY" else "SHORT"
-        price = float(latest['close'])
-        atr = float(latest['atr']) if not pd.isna(latest['atr']) else price * 0.01
-
-        p = self.ai_optimizer.get_params(symbol)
-
-        if side == "BUY":
-            stop_loss = min(float(latest['support']), price - (p["sl_atr_mult"] * atr))
-            risk = price - stop_loss
-            tp1 = round(price + (p["tp1_mult"] * risk), 4)
-            tp2 = round(price + (p["tp2_mult"] * risk), 4)
-            tp3 = round(price + (p["tp3_mult"] * risk), 4)
-            stop_loss = round(stop_loss, 4)
-        else:
-            stop_loss = max(float(latest['resistance']), price + (p["sl_atr_mult"] * atr))
-            risk = stop_loss - price
-            tp1 = round(price - (p["tp1_mult"] * risk), 4)
-            tp2 = round(price - (p["tp2_mult"] * risk), 4)
-            tp3 = round(price - (p["tp3_mult"] * risk), 4)
-            stop_loss = round(stop_loss, 4)
-
-        btc_volatility_pctl = (macro_context or {}).get("btc_volatility_pctl")
-        stress_active = btc_volatility_pctl is not None and btc_volatility_pctl >= p["stress_pctl_threshold"]
-        size_mult = p["stress_size_mult"] if stress_active else 1.0
-
-        qty = self.risk_manager.calculate_position_size(price, stop_loss, size_mult=size_mult)
-        notional = qty * price
-        rr_ratio = p["tp1_mult"]
-
-        stress_note = ""
-        if stress_active:
-            stress_note = f"\n⚠️ **استرس بازار شناسایی شد** (نوسان بیت‌کوین در پرسنتایل {btc_volatility_pctl:.0f}) - حجم پوزیشن به {size_mult*100:.0f}٪ حجم عادی کاهش یافت\n"
-
-        message = f"""
+            message = f"""
 {emoji} **ANTI-LOSS ULTRA SIGNAL: {side} / {direction}**
 
 📍 **Symbol:** {symbol}
-⏱ **Timeframe:** {timeframe} (Trend 4H: {trend_4h})
+⏱ **Timeframe:** {config.ENTRY_TIMEFRAME} (Trend 4H: {trend_4h})
 
 💵 **Entry Price:** {price:,}
 
@@ -1548,79 +1235,660 @@ class TelegramSender:
 🛑 **Stop-Loss:** {stop_loss:,}
 ⚖️ **R:R تا TP1:** 1:{rr_ratio:.2f}
 {stress_note}
-💰 **پیشنهاد حجم (ریسک {self.config.RISK_PER_TRADE_PCT}% سرمایه):**
+💰 **پیشنهاد حجم (ریسک {config.RISK_PER_TRADE_PCT}% سرمایه):**
   مقدار: {qty:.6f} | ارزش: {notional:,.2f} USDT
 
 📊 **Metrics:** RSI: {latest['rsi']:.1f} | Market Guardrails Active
 🧠 **قضاوت AI (اطمینان {judge_confidence}%):** {judge_reason if judge_reason else '—'}
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}
 """
-        try:
-            r = requests.post(f"{self.base_url}/sendMessage",
-                               json={"chat_id": self.config.TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"},
-                               timeout=10)
+            url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
+            payload = {
+                "chat_id": config.TELEGRAM_CHANNEL_ID,
+                "text": message,
+                "parse_mode": "Markdown"
+            }
+            r = requests.post(url, json=payload, timeout=10)
             if r.status_code != 200:
                 logger.error(f"ارسال سیگنال ناموفق بود: {r.status_code} {r.text}")
-                return None
-            logger.info(f"سیگنال ضد ضرر {side} برای {symbol} ارسال شد")
-            return {"price": price, "tp1": tp1, "tp2": tp2, "tp3": tp3, "sl": stop_loss, "qty": qty, "atr": atr}
+                return False
+            logger.info("پیام سیگنال با موفقیت به کانال تلگرام ارسال شد.")
+            return True
         except Exception as e:
-            logger.error(f"خطای ارسال تلگرام: {e}")
+            logger.error(f"خطا در ارسال پیام به کانال تلگرام: {e}")
+            return False
+
+    @staticmethod
+    def send_system_status(text: str):
+        config = Config()
+        if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHANNEL_ID:
+            return
+        try:
+            url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
+            r = requests.post(url, json={"chat_id": config.TELEGRAM_CHANNEL_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
+            if r.status_code != 200:
+                logger.error(f"ارسال پیام وضعیت ناموفق بود: {r.status_code} {r.text}")
+        except Exception as e:
+            logger.error(f"خطای ارسال پیام به تلگرام: {e}")
+
+    @staticmethod
+    def send_to_personal(message: str):
+        config = Config()
+        if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_PERSONAL_ID:
+            return
+        try:
+            url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
+            payload = {
+                "chat_id": config.TELEGRAM_PERSONAL_ID,
+                "text": message,
+                "parse_mode": "Markdown"
+            }
+            requests.post(url, json=payload, timeout=10)
+            logger.info("پیام گزارش به پی‌وی تلگرام ارسال شد.")
+        except Exception as e:
+            logger.error(f"خطا در ارسال پیام به پی‌وی تلگرام: {e}")
+
+    @staticmethod
+    def send_personal_with_button(message: str, button_text: str, callback_data: str):
+        """ارسال پیام به پی‌وی با یک کلید اینلاین ساده."""
+        config = Config()
+        if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_PERSONAL_ID:
+            return
+        try:
+            url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
+            payload = {
+                "chat_id": config.TELEGRAM_PERSONAL_ID,
+                "text": message,
+                "parse_mode": "Markdown",
+                "reply_markup": {
+                    "inline_keyboard": [[{"text": button_text, "callback_data": callback_data}]]
+                }
+            }
+            r = requests.post(url, json=payload, timeout=10)
+            if r.status_code != 200:
+                logger.error(f"ارسال پیام با دکمه ناموفق: {r.status_code} {r.text}")
+        except Exception as e:
+            logger.error(f"خطا در ارسال پیام با دکمه: {e}")
+
+    @staticmethod
+    def answer_callback(callback_query_id: str, text: str = "ثبت شد"):
+        config = Config()
+        if not config.TELEGRAM_BOT_TOKEN:
+            return
+        try:
+            url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
+            requests.post(url, json={"callback_query_id": callback_query_id, "text": text}, timeout=8)
+        except Exception as e:
+            logger.error(f"خطا در answerCallbackQuery: {e}")
+
+# ==================== محافظت روزانه سود/ضرر (۸٪ ضرر / ۲٪ سود) ====================
+class DailyProtectionGuard:
+    """
+    دوره ۲۴ ساعته از PERIOD_RESET_HOUR.
+    - ضرر >= ۸٪ → توقف ارسال به همروش (سیگنال تلگرام ادامه) + کلید ازسرگیری دستی
+    - سود >= ۲٪ → پیام + کلید توقف؛ اگر جواب نداد AI تصمیم می‌گیرد
+    همه‌چیز با try/except امن است تا کرش نکند.
+    """
+    def __init__(self, config: Config, journal: "TradeJournal", ai_optimizer: "AIParameterOptimizer"):
+        self.config = config
+        self.journal = journal
+        self.ai_optimizer = ai_optimizer
+        self.period_start: datetime = self._compute_period_start()
+        self.real_trading_enabled: bool = True
+        self.loss_halted: bool = False
+        self.user_force_resume: bool = False
+        self.user_profit_pause: bool = False
+        self.profit_alert_sent: bool = False
+        self.profit_alert_time: Optional[datetime] = None
+        self.profit_ai_decided: bool = False
+        self.loss_alert_sent: bool = False
+        self.last_ai_resume_check: Optional[datetime] = None
+
+    def _compute_period_start(self) -> datetime:
+        now = datetime.now()
+        start = now.replace(hour=self.config.PERIOD_RESET_HOUR, minute=0, second=0, microsecond=0)
+        if now < start:
+            start -= timedelta(days=1)
+        return start
+
+    def check_period_rollover(self):
+        new_start = self._compute_period_start()
+        if new_start > self.period_start:
+            logger.info(f"ریست دوره ۲۴ ساعته محافظت سود/ضرر از {new_start}")
+            self.period_start = new_start
+            self.real_trading_enabled = True
+            self.loss_halted = False
+            self.user_force_resume = False
+            self.user_profit_pause = False
+            self.profit_alert_sent = False
+            self.profit_alert_time = None
+            self.profit_ai_decided = False
+            self.loss_alert_sent = False
+            self.last_ai_resume_check = None
+            try:
+                TelegramNotifier.send_to_personal(
+                    f"🔄 **دوره جدید ۲۴ ساعته شروع شد** ({new_start.strftime('%Y-%m-%d %H:%M')})\n"
+                    f"معاملات واقعی دوباره فعال است. سقف ضرر {self.config.DAILY_HARD_LOSS_PCT}% | قفل سود {self.config.DAILY_PROFIT_LOCK_PCT}%"
+                )
+            except Exception:
+                pass
+
+    def period_pnl_usdt(self) -> float:
+        return self.journal.get_realized_pnl_usdt_since(self.period_start)
+
+    def period_pnl_pct(self) -> float:
+        capital = self.config.VIRTUAL_CAPITAL_USDT or 10000.0
+        if capital <= 0:
+            return 0.0
+        return (self.period_pnl_usdt() / capital) * 100.0
+
+    def can_send_to_hamravesh(self) -> bool:
+        if self.user_profit_pause:
+            return False
+        if self.loss_halted and not self.user_force_resume:
+            return False
+        return self.real_trading_enabled
+
+    def on_user_accept_profit_pause(self):
+        self.user_profit_pause = True
+        self.real_trading_enabled = False
+        logger.info("کاربر قفل سود +۲٪ را پذیرفت — معاملات واقعی تا ریست بعدی متوقف شد.")
+        try:
+            TelegramNotifier.send_to_personal(
+                f"✅ قفل سود فعال شد.\nبرآیند دوره: {self.period_pnl_pct():+.2f}%\n"
+                "تا ساعت ریست بعدی به همروش دستور معامله ارسال نمی‌شود. سیگنال خام تلگرام ادامه دارد."
+            )
+        except Exception:
+            pass
+
+    def on_user_force_resume(self):
+        self.user_force_resume = True
+        self.loss_halted = False
+        self.real_trading_enabled = True
+        self.user_profit_pause = False
+        logger.info("کاربر ازسرگیری اجباری را زد — معاملات واقعی بدون توجه به سقف ضرر از سر گرفته شد.")
+        try:
+            TelegramNotifier.send_to_personal(
+                "▶️ ازسرگیری اجباری فعال شد.\nمعاملات واقعی دوباره شروع می‌شود (تا ریست دوره یا تصمیم بعدی)."
+            )
+        except Exception:
+            pass
+
+    def update_and_act(self, macro_context: Optional[dict] = None):
+        """هر چرخه فراخوانی می‌شود — آستانه‌ها را چک و در صورت نیاز پیام/AI می‌فرستد."""
+        try:
+            self.check_period_rollover()
+            pnl_pct = self.period_pnl_pct()
+
+            # ---- سقف ضرر ۸٪ ----
+            if (not self.user_force_resume and not self.loss_halted
+                    and pnl_pct <= -self.config.DAILY_HARD_LOSS_PCT):
+                self.loss_halted = True
+                self.real_trading_enabled = False
+                if not self.loss_alert_sent:
+                    self.loss_alert_sent = True
+                    msg = (
+                        f"🛑 **سقف ضرر روزانه فعال شد**\n\n"
+                        f"برآیند دوره از {self.period_start.strftime('%H:%M')}: **{pnl_pct:+.2f}%**\n"
+                        f"(آستانه: −{self.config.DAILY_HARD_LOSS_PCT}%)\n\n"
+                        "معاملات واقعی متوقف شد. تحلیل و سیگنال خام تلگرام ادامه دارد.\n"
+                        "اگر می‌خواهی بدون توجه به این ضرر دوباره واقعی معامله شود، کلید زیر را بزن:"
+                    )
+                    TelegramNotifier.send_personal_with_button(
+                        msg, "▶️ ازسرگیری اجباری معاملات واقعی", "force_resume"
+                    )
+
+            # ---- قفل سود ۲٪ ----
+            if (not self.user_profit_pause and not self.profit_alert_sent
+                    and pnl_pct >= self.config.DAILY_PROFIT_LOCK_PCT):
+                self.profit_alert_sent = True
+                self.profit_alert_time = datetime.now()
+                msg = (
+                    f"🎯 **هدف سود دوره رسید**\n\n"
+                    f"برآیند از {self.period_start.strftime('%H:%M')}: **{pnl_pct:+.2f}%**\n"
+                    f"(آستانه: +{self.config.DAILY_PROFIT_LOCK_PCT}%)\n\n"
+                    "اگر می‌خواهی تا ریست بعدی دیگر معامله واقعی نکنیم، کلید را بزن.\n"
+                    f"اگر جواب ندهی، پس از حدود {self.config.PROFIT_AI_WAIT_MINUTES} دقیقه "
+                    "هوش مصنوعی با داده‌های دوره تصمیم منطقی می‌گیرد."
+                )
+                TelegramNotifier.send_personal_with_button(
+                    msg, "✅ توقف معاملات واقعی تا ریست", "pause_accept"
+                )
+
+            # ---- AI برای قفل سود اگر کاربر جواب نداد ----
+            if (self.profit_alert_sent and not self.user_profit_pause
+                    and not self.profit_ai_decided and self.profit_alert_time is not None):
+                waited = (datetime.now() - self.profit_alert_time).total_seconds() / 60.0
+                if waited >= self.config.PROFIT_AI_WAIT_MINUTES:
+                    self.profit_ai_decided = True
+                    self._ai_decide_profit_pause(pnl_pct, macro_context)
+
+            # ---- AI ازسرگیری بعد از ضرر ۸٪ (اگر کاربر force نکرده) ----
+            if self.loss_halted and not self.user_force_resume and not self.user_profit_pause:
+                should_check = (
+                    self.last_ai_resume_check is None
+                    or (datetime.now() - self.last_ai_resume_check) >= timedelta(hours=1)
+                )
+                if should_check:
+                    self.last_ai_resume_check = datetime.now()
+                    self._ai_decide_resume_after_loss(pnl_pct, macro_context)
+        except Exception as e:
+            logger.error(f"خطا در DailyProtectionGuard.update_and_act (ادامه بدون کرش): {e}")
+
+    def _ai_decide_profit_pause(self, pnl_pct: float, macro_context: Optional[dict]):
+        """تصمیم منطقی AI برای توقف یا ادامه بعد از +۲٪ — نه خیلی سخت‌گیر نه خیلی آسان‌گیر."""
+        if not self.ai_optimizer.groq_api_key:
+            return
+        try:
+            ctx = {
+                "period_pnl_pct": round(pnl_pct, 2),
+                "period_start": self.period_start.isoformat(),
+                "fear_greed": (macro_context or {}).get("fear_greed"),
+                "btc_trend_4h": (macro_context or {}).get("btc_trend_4h"),
+                "btc_structure": (macro_context or {}).get("btc_structure"),
+                "btc_volatility_pctl": (macro_context or {}).get("btc_volatility_pctl"),
+                "trade_count_period": sum(
+                    1 for r in self.journal.records
+                    if datetime.fromisoformat(r["timestamp"]) >= self.period_start
+                ) if self.journal.records else 0,
+            }
+            prompt = f"""You are a balanced risk manager for a crypto spot bot. The daily period P&L already reached about +{pnl_pct:.2f}% (target lock was +{self.config.DAILY_PROFIT_LOCK_PCT}%).
+Context: {json.dumps(ctx, ensure_ascii=False)}
+Decide whether to STOP further real trades until the next daily reset, or CONTINUE.
+Be moderate: stopping at ~2% in a day is reasonable and good; only CONTINUE if the market context clearly still favors orderly trend continuation without signs of exhaustion or extreme greed.
+Respond ONLY JSON: {{"stop": true or false, "reason": "one short sentence in Persian"}}"""
+            headers = {"Authorization": f"Bearer {self.ai_optimizer.groq_api_key}", "Content-Type": "application/json"}
+            payload = {
+                "model": "openai/gpt-oss-120b",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.25,
+                "reasoning_effort": "low",
+                "max_tokens": 200
+            }
+            resp = self.ai_optimizer._post_with_retry(
+                f"{self.ai_optimizer.groq_endpoint}v1/chat/completions", payload, headers, timeout=20, label="profit_guard"
+            )
+            if resp is None or resp.status_code != 200:
+                return
+            content = resp.json()['choices'][0]['message']['content'].strip()
+            if content.startswith("```"):
+                content = content.strip("`").replace("json\n", "").strip()
+            result = json.loads(content)
+            if result.get("stop"):
+                self.user_profit_pause = True
+                self.real_trading_enabled = False
+                TelegramNotifier.send_to_personal(
+                    f"🧠 تصمیم AI (قفل سود): توقف معاملات واقعی تا ریست.\nدلیل: {result.get('reason', '—')}"
+                )
+            else:
+                TelegramNotifier.send_to_personal(
+                    f"🧠 تصمیم AI (قفل سود): ادامه معاملات واقعی.\nدلیل: {result.get('reason', '—')}"
+                )
+        except Exception as e:
+            logger.error(f"خطا در AI قفل سود (نادیده): {e}")
+
+    def _ai_decide_resume_after_loss(self, pnl_pct: float, macro_context: Optional[dict]):
+        """آیا بعد از ضرر ۸٪ می‌شود دوباره واقعی معامله کرد؟ منطقی و متعادل."""
+        if not self.ai_optimizer.groq_api_key:
+            return
+        try:
+            ctx = {
+                "period_pnl_pct": round(pnl_pct, 2),
+                "fear_greed": (macro_context or {}).get("fear_greed"),
+                "btc_trend_4h": (macro_context or {}).get("btc_trend_4h"),
+                "btc_structure": (macro_context or {}).get("btc_structure"),
+                "btc_volatility_pctl": (macro_context or {}).get("btc_volatility_pctl"),
+            }
+            prompt = f"""You are a cautious but practical risk manager. Real trading was halted after period loss reached about {pnl_pct:.2f}% (limit -{self.config.DAILY_HARD_LOSS_PCT}%).
+Context: {json.dumps(ctx, ensure_ascii=False)}
+Should we RESUME real trading now? Only resume if conditions look calmer (volatility not extreme, structure not clearly hostile). Prefer staying halted if unsure.
+Respond ONLY JSON: {{"resume": true or false, "reason": "one short sentence in Persian"}}"""
+            headers = {"Authorization": f"Bearer {self.ai_optimizer.groq_api_key}", "Content-Type": "application/json"}
+            payload = {
+                "model": "openai/gpt-oss-120b",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.25,
+                "reasoning_effort": "low",
+                "max_tokens": 200
+            }
+            resp = self.ai_optimizer._post_with_retry(
+                f"{self.ai_optimizer.groq_endpoint}v1/chat/completions", payload, headers, timeout=20, label="loss_resume"
+            )
+            if resp is None or resp.status_code != 200:
+                return
+            content = resp.json()['choices'][0]['message']['content'].strip()
+            if content.startswith("```"):
+                content = content.strip("`").replace("json\n", "").strip()
+            result = json.loads(content)
+            if result.get("resume"):
+                self.loss_halted = False
+                self.real_trading_enabled = True
+                TelegramNotifier.send_to_personal(
+                    f"🧠 تصمیم AI: ازسرگیری معاملات واقعی.\nدلیل: {result.get('reason', '—')}"
+                )
+            else:
+                logger.info(f"AI هنوز ازسرگیری بعد از ضرر را رد کرد: {result.get('reason')}")
+        except Exception as e:
+            logger.error(f"خطا در AI ازسرگیری بعد از ضرر (نادیده): {e}")
+
+# ==================== وب‌سرور رندر ====================
+# ارجاع سراسری به سیستم اصلی تا وب‌هوک بتواند وضعیت واقعی را به‌روز کند
+_global_system: Optional["RenderSignalSystem"] = None
+
+class RenderWebhookHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"Render Signal Generator is alive and running!")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/html; charset=utf-8")
+        self.end_headers()
+
+    def do_POST(self):
+        try:
+            auth_token = self.headers.get("X-Secret-Token")
+            config = Config()
+
+            if config.SECRET_TOKEN and auth_token != config.SECRET_TOKEN:
+                logger.warning("تلاش برای دسترسی غیرمجاز به وب‌هوک رندر با توکن اشتباه.")
+                self.send_response(403)
+                self.end_headers()
+                return
+
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length)
+
+            if not post_data:
+                self.send_response(200)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "ok"}).encode('utf-8'))
+                return
+
+            data = json.loads(post_data.decode('utf-8'))
+            action = data.get("action")
+
+            if action == "ping":
+                self.send_response(200)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "pong"}).encode('utf-8'))
+                return
+
+            if action == "close_trade":
+                # فیدبک واقعی از همروش - بدون کرش، با مقادیر پیش‌فرض امن
+                try:
+                    symbol = data.get("symbol") or ""
+                    exit_price = float(data.get("exit_price") or 0)
+                    pnl_pct = float(data.get("pnl") or 0)
+                    logger.info(f"گزارش بسته شدن معامله واقعی دریافت شد: {symbol} | نتیجه: {pnl_pct}%")
+
+                    emoji = "✅" if pnl_pct >= 0 else "❌"
+                    status_text = "سود" if pnl_pct >= 0 else "زیان"
+
+                    close_msg = (
+                        f"{emoji} **گزارش نتیجه نهایی معامله (اسپات)** {emoji}\n\n"
+                        f"💎 نماد: `{symbol}`\n"
+                        f"💵 قیمت خروج: `{exit_price}`\n"
+                        f"📊 نتیجه: **{status_text} با {pnl_pct:+.2f}%**\n"
+                        f"🏷 صرافی: `والکس (Wallex)`"
+                    )
+                    TelegramNotifier.send_to_personal(close_msg)
+
+                    # به‌روزرسانی وضعیت تصمیم‌گیری از فیدبک واقعی (بدون کرش)
+                    if _global_system is not None and symbol:
+                        _global_system.handle_real_close(symbol, exit_price, pnl_pct)
+                except Exception as e:
+                    logger.error(f"خطا در پردازش close_trade (ادامه بدون کرش): {e}")
+
+            if action == "trade_failed":
+                # همروش نتوانست سفارش را در صرافی اجرا کند — پوزیشن ساختگی را پاک کن
+                try:
+                    symbol = data.get("symbol") or ""
+                    logger.warning(f"همروش اعلام کرد معامله {symbol} اجرا نشد — حذف از لیست باز")
+                    if _global_system is not None and symbol:
+                        _global_system.handle_trade_failed(symbol)
+                except Exception as e:
+                    logger.error(f"خطا در پردازش trade_failed (ادامه بدون کرش): {e}")
+
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "received"}).encode('utf-8'))
+
+        except Exception as e:
+            logger.error(f"خطا در پردازش وب‌هوک برگشتی در رندر: {e}")
+            self.send_response(500)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+def start_render_server():
+    port = int(os.environ.get("PORT", 10000))
+    try:
+        server = HTTPServer(("0.0.0.0", port), RenderWebhookHandler)
+        server.serve_forever()
+    except Exception as e:
+        logger.error(f"خطا در اجرای وب‌سرور رندر: {e}")
+
+threading.Thread(target=start_render_server, daemon=True).start()
+
+# ==================== صرافی (کوین‌اکس) ====================
+class PublicMarketDataFetcher:
+    def __init__(self, config: Config):
+        try:
+            exchange_class = getattr(ccxt, config.EXCHANGE_ID)
+            self.exchange = exchange_class({
+                'apiKey': config.API_KEY,
+                'secret': config.SECRET,
+                'enableRateLimit': True,
+                'options': {'defaultType': 'spot'}
+            })
+            logger.info(f"اتصال به صرافی {config.EXCHANGE_ID} با موفقیت برقرار شد.")
+        except Exception as e:
+            logger.error(f"خطا در ایجاد اتصال صرافی: {e}")
+            self.exchange = None
+
+    def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 100) -> list:
+        if not self.exchange:
+            return []
+        try:
+            ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+            return ohlcv
+        except Exception as e:
+            logger.error(f"خطا در دریافت کندل‌های {symbol} ({timeframe}): {e}")
+            return []
+
+    def fetch_ohlcv_df(self, symbol: str, timeframe: str, limit: int = 150) -> pd.DataFrame:
+        ohlcv = self.fetch_ohlcv(symbol, timeframe, limit=limit)
+        if not ohlcv:
+            return pd.DataFrame()
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        return df
+
+    def fetch_funding_rate(self, symbol: str) -> Optional[float]:
+        if not self.exchange:
+            return None
+        try:
+            funding_symbol = symbol.replace("/USDT", "/USDT:USDT")
+            data = self.exchange.fetch_funding_rate(funding_symbol)
+            rate = data.get("fundingRate") if data else None
+            return float(rate) if rate is not None else None
+        except Exception:
             return None
 
-# ==================== سیستم اصلی ====================
-class HybridTradingSystem:
+    def fetch_spread_pct(self, symbol: str) -> Optional[float]:
+        if not self.exchange:
+            return None
+        try:
+            ob = self.exchange.fetch_order_book(symbol, limit=5)
+            best_bid = ob['bids'][0][0] if ob.get('bids') else None
+            best_ask = ob['asks'][0][0] if ob.get('asks') else None
+            if not best_bid or not best_ask:
+                return None
+            mid = (best_bid + best_ask) / 2
+            if mid <= 0:
+                return None
+            return float((best_ask - best_bid) / mid * 100)
+        except Exception:
+            return None
+
+def verify_and_notify_startup(config: Config):
+    if not config.HAMRAVESH_WEBHOOK_URL:
+        logger.warning("آدرس وب‌هوک همروش تنظیم نشده است؛ اتصال کامل تایید نمی‌شود.")
+        return
+
+    max_retries = 10
+    delay = 6
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info(f"تلاش {attempt}/{max_retries} برای بررسی اتصال چرخه کامل رندر <-> همروش...")
+            headers = {"X-Secret-Token": config.SECRET_TOKEN}
+            response = requests.post(config.HAMRAVESH_WEBHOOK_URL, json={"action": "ping"}, headers=headers, timeout=5)
+
+            if response.status_code == 200:
+                logger.info("اتصال چرخه کامل رندر و همروش با موفقیت برقرار شد و تایید گردید.")
+                startup_msg = "🚀 ربات هیبرید با موفقیت روشن شد: تمام چرخه‌ها (رندر، همروش، تحلیل و صرافی) کاملاً متصل و عملیاتی هستند."
+                TelegramNotifier.send_to_personal(startup_msg)
+                return
+        except Exception as e:
+            logger.warning(f"تلاش {attempt}: هنوز ارتباط کامل برقرار نشده است ({e})")
+        time.sleep(delay)
+
+    logger.error("خطا: چرخه‌های رندر و همروش به طور کامل متصل نشدند؛ پیام راه‌اندازی ارسال نگردید.")
+
+class RenderSignalSystem:
     def __init__(self):
         self.config = Config()
         self.config.validate()
-        self.data = DataLayer(self.config)
+        self.data_fetcher = PublicMarketDataFetcher(self.config)
         self.analysis = AnalysisLayer(self.config)
         self.macro_data = MacroDataLayer()
         self.ai_optimizer = AIParameterOptimizer(self.config)
         self.signal_engine = SignalEngine(self.config, self.ai_optimizer, self.analysis)
         self.risk_manager = RiskManager(self.config)
-        self.telegram = TelegramSender(self.config, self.ai_optimizer, self.risk_manager)
         self.journal = TradeJournal()
-        self.paper_trader = PaperTrader(self.config, self.telegram, self.ai_optimizer, self.journal)
-        self.correlation_manager = CorrelationManager(self.config, self.data)
-        # وقتی سهمیه‌ی Groq تموم/برگردونده بشه یا اتصال قطع/برقرار بشه، از همون مسیر
-        # هشدار خطا به تلگرام خبر بده
+        # ردیاب سبک معاملات باز واقعی (بدون شبیه‌سازی مجازی)
+        self.active_tracker = ActivePositionsTracker()
+        self.correlation_manager = CorrelationManager(self.config, self.data_fetcher)
+        # محافظت روزانه ۸٪ ضرر / ۲٪ سود
+        self.daily_guard = DailyProtectionGuard(self.config, self.journal, self.ai_optimizer)
+        # وقتی سهمیه‌ی Groq تموم/برگشت یا اتصال قطع/برقرار شد، از همین مسیر به تلگرام خبر بده
         self.ai_optimizer.on_quota_exhausted_callback = self._send_crash_alert
         self.running = True
         self.last_signal_time: Dict[str, datetime] = {}
         self.last_summary_date: Optional[str] = date_cls.today().isoformat()
-        # واچ‌داگ قطعی داده/API: اگه همه‌ی نمادها چند چرخه‌ی متوالی fetch ناموفق داشته باشن،
-        # احتمالاً صرافی یا شبکه مشکل داره - یه هشدار (نه بیشتر) به تلگرام شخصی می‌فرسته
+        # واچ‌داگ قطعی داده/API
         self.consecutive_full_cycle_failures = 0
         self.data_outage_alert_sent = False
+        self._tg_update_offset = 0
 
     def _send_crash_alert(self, text: str):
-        """ارسال هشدار خطا - خودش هم تو try/except پیچیده شده تا اگه ارسال هشدار هم
-        شکست خورد (مثلاً قطعی اینترنت)، باعث کرش بیشتر بات نشه."""
         try:
-            self.telegram.send_error_alert(text)
+            TelegramNotifier.send_to_personal(f"🚨 **هشدار سیستم** 🚨\n\n{text}")
         except Exception:
             logger.error("حتی ارسال هشدار خطا هم ناموفق بود.")
 
-    def _start_trade_monitor_thread(self):
+    def handle_real_close(self, symbol: str, exit_price: float, pnl_pct: float):
         """
-        ترد مستقل و موازی با چرخه‌ی اصلی سیگنال‌گیری که فقط معاملات باز رو با فاصله‌ی
-        بسیار کوتاه‌تر (TRADE_MONITOR_INTERVAL_SECONDS) چک می‌کنه - قبلاً این کار فقط هر
-        ۵ دقیقه (در انتهای هر چرخه‌ی اصلی) انجام می‌شد که برای برخورد دقیق به SL/TP در
-        بازار سریع کافی نبود. این ترد هیچ فراخوانی Groq نداره (فقط fetch_ohlcv از صرافی)،
-        پس مصرف پلن رایگان هوش مصنوعی رو بالا نمی‌بره.
+        پردازش فیدبک واقعی بسته شدن معامله از همروش.
+        - ژورنال واقعی به‌روز می‌شود
+        - blacklist / consecutive_losses به‌روز می‌شود
+        - وضعیت معاملات باز حذف می‌شود
+        همه‌چیز با try/except امن است تا کرش نکند.
         """
-        def monitor_loop():
-            while self.running:
-                try:
-                    self.paper_trader.update_and_check_trades(self.data)
-                except Exception as e:
-                    logger.error(f"خطا در ترد مانیتورینگ لحظه‌ای معاملات: {e}")
-                    self._send_crash_alert(f"خطا در ترد مانیتورینگ معاملات باز:\n`{e}`")
-                time.sleep(self.config.TRADE_MONITOR_INTERVAL_SECONDS)
+        try:
+            closed_pos = self.active_tracker.mark_closed(symbol)
+            entry = float(closed_pos["entry"]) if closed_pos else 0.0
+            original_sl = float(closed_pos.get("original_sl") or closed_pos.get("sl") or 0) if closed_pos else 0.0
+            notional = float(closed_pos.get("notional") or 0) if closed_pos else 0.0
+            side = (closed_pos.get("side") if closed_pos else "BUY") or "BUY"
 
-        threading.Thread(target=monitor_loop, daemon=True, name="TradeMonitor").start()
-        logger.info(f"ترد مانیتورینگ لحظه‌ای معاملات فعال شد (هر {self.config.TRADE_MONITOR_INTERVAL_SECONDS} ثانیه)")
+            # تخمین pnl_usdt و r_multiple از داده‌ی واقعی موجود
+            pnl_usdt = 0.0
+            r_multiple = 0.0
+            if entry > 0 and notional > 0:
+                pnl_usdt = notional * (pnl_pct / 100.0)
+            if entry > 0 and original_sl > 0:
+                risk_per_unit = abs(entry - original_sl)
+                if risk_per_unit > 0:
+                    price_diff = exit_price - entry if side == "BUY" else entry - exit_price
+                    r_multiple = price_diff / risk_per_unit
+
+            reason = "بسته شدن واقعی از همروش (TP/SL)"
+            self.journal.record(symbol, side, reason, pnl_usdt, pnl_pct, r_multiple, 100.0)
+
+            if pnl_pct > 0:
+                self.ai_optimizer.register_win(symbol)
+            else:
+                self.ai_optimizer.register_loss(symbol)
+
+            logger.info(f"فیدبک واقعی ثبت شد: {symbol} | pnl={pnl_pct:+.2f}% | R≈{r_multiple:+.2f}")
+        except Exception as e:
+            logger.error(f"خطا در handle_real_close برای {symbol} (ادامه بدون کرش): {e}")
+
+    def handle_trade_failed(self, symbol: str):
+        """همروش نتوانست معامله را اجرا کند — فقط از لیست باز حذف می‌شود (بدون ثبت باخت)."""
+        try:
+            self.active_tracker.mark_closed(symbol)
+            logger.info(f"پوزیشن ساختگی {symbol} به‌خاطر trade_failed حذف شد.")
+        except Exception as e:
+            logger.error(f"خطا در handle_trade_failed برای {symbol}: {e}")
+
+    def handle_telegram_callback(self, callback_data: str, callback_query_id: str):
+        try:
+            TelegramNotifier.answer_callback(callback_query_id)
+            if callback_data == "pause_accept":
+                self.daily_guard.on_user_accept_profit_pause()
+            elif callback_data == "force_resume":
+                self.daily_guard.on_user_force_resume()
+        except Exception as e:
+            logger.error(f"خطا در handle_telegram_callback: {e}")
+
+    def _telegram_updates_loop(self):
+        """long-polling سبک برای دریافت کلیک دکمه‌های تلگرام — کرش‌نمی‌کند."""
+        token = self.config.TELEGRAM_BOT_TOKEN
+        if not token:
+            return
+        url = f"https://api.telegram.org/bot{token}/getUpdates"
+        while self.running:
+            try:
+                resp = requests.get(
+                    url,
+                    params={"offset": self._tg_update_offset, "timeout": 25, "allowed_updates": json.dumps(["callback_query"])},
+                    timeout=35
+                )
+                if resp.status_code != 200:
+                    time.sleep(5)
+                    continue
+                for upd in resp.json().get("result", []):
+                    self._tg_update_offset = upd["update_id"] + 1
+                    cq = upd.get("callback_query")
+                    if not cq:
+                        continue
+                    data = cq.get("data") or ""
+                    cq_id = cq.get("id") or ""
+                    if data and cq_id:
+                        self.handle_telegram_callback(data, cq_id)
+            except Exception as e:
+                logger.error(f"خطا در telegram updates loop (ادامه): {e}")
+                time.sleep(8)
+
+    def send_signal_to_hamravesh(self, payload: dict):
+        if not self.config.HAMRAVESH_WEBHOOK_URL:
+            return
+        try:
+            headers = {"X-Secret-Token": self.config.SECRET_TOKEN}
+            requests.post(self.config.HAMRAVESH_WEBHOOK_URL, json=payload, headers=headers, timeout=15)
+            logger.info(f"سیگنال نماد {payload.get('symbol')} با موفقیت به همروش ارسال شد.")
+        except Exception as e:
+            logger.error(f"خطا در ارسال سیگنال به همروش: {e}")
 
     def _build_macro_context(self) -> dict:
         context = {"fear_greed": None, "btc_trend_4h": None, "btc_structure": None, "btc_volatility_pctl": None,
@@ -1631,16 +1899,18 @@ class HybridTradingSystem:
             logger.warning(f"خطا در دریافت شاخص ترس‌وطمع: {e}")
 
         try:
-            context["btc_reference_trade"] = self.paper_trader.get_reference_trade_health("BTC/USDT")
+            context["btc_reference_trade"] = self.active_tracker.get_reference_trade_health(
+                "BTC/USDT", self.journal
+            )
         except Exception as e:
             logger.warning(f"خطا در دریافت وضعیت معامله‌ی مرجع بیت‌کوین: {e}")
 
         try:
-            btc_df_4h = self.data.fetch_ohlcv("BTC/USDT", timeframe=self.config.TREND_TIMEFRAME, limit=self.config.TREND_WARMUP_CANDLES)
+            btc_df_4h = self.data_fetcher.fetch_ohlcv_df("BTC/USDT", self.config.TREND_TIMEFRAME, limit=self.config.TREND_WARMUP_CANDLES)
             btc_df_4h = self.analysis.calculate_indicators(btc_df_4h)
             context["btc_trend_4h"] = self.analysis.get_major_trend(btc_df_4h)
 
-            btc_df_15m = self.data.fetch_ohlcv("BTC/USDT", timeframe=self.config.ENTRY_TIMEFRAME)
+            btc_df_15m = self.data_fetcher.fetch_ohlcv_df("BTC/USDT", self.config.ENTRY_TIMEFRAME)
             btc_df_15m = self.analysis.calculate_indicators(btc_df_15m)
             context["btc_structure"] = self.analysis.market_structure(btc_df_15m)
             context["btc_volatility_pctl"] = self.analysis.atr_percentile(btc_df_15m)
@@ -1657,9 +1927,9 @@ class HybridTradingSystem:
 
     def process_symbol(self, symbol: str, macro_context: Optional[dict] = None) -> bool:
         """خروجی: True یعنی دریافت داده‌ی این نماد موفق بود (حتی اگه سیگنالی صادر نشد)،
-        False یعنی fetch داده شکست خورد - برای واچ‌داگ قطعی API استفاده می‌شه."""
+        False یعنی fetch داده شکست خورد - برای واچ‌داگ قطعی API."""
         try:
-            df_15m = self.data.fetch_ohlcv(symbol, timeframe=self.config.ENTRY_TIMEFRAME)
+            df_15m = self.data_fetcher.fetch_ohlcv_df(symbol, self.config.ENTRY_TIMEFRAME)
             df_15m = self.analysis.calculate_indicators(df_15m)
             if df_15m.empty:
                 return False
@@ -1668,18 +1938,18 @@ class HybridTradingSystem:
                 logger.info(f"بروزرسانی پارامترهای ضد ضرر هوش مصنوعی برای {symbol}...")
                 self.ai_optimizer.optimize_symbol_parameters(symbol, df_15m, journal=self.journal)
 
-            df_1h = self.data.fetch_ohlcv(symbol, timeframe=self.config.CONFIRM_TIMEFRAME)
+            df_1h = self.data_fetcher.fetch_ohlcv_df(symbol, self.config.CONFIRM_TIMEFRAME)
             df_1h = self.analysis.calculate_indicators(df_1h)
 
-            df_4h = self.data.fetch_ohlcv(symbol, timeframe=self.config.TREND_TIMEFRAME, limit=self.config.TREND_WARMUP_CANDLES)
+            df_4h = self.data_fetcher.fetch_ohlcv_df(symbol, self.config.TREND_TIMEFRAME, limit=self.config.TREND_WARMUP_CANDLES)
             df_4h = self.analysis.calculate_indicators(df_4h)
-            trend_4h = self.analysis.get_major_trend(df_4h)
+            trend = self.analysis.get_major_trend(df_4h)
 
             symbol_macro_context = dict(macro_context or {})
-            symbol_macro_context["funding_rate"] = self.data.fetch_funding_rate(symbol)
-            symbol_macro_context["spread_pct"] = self.data.fetch_spread_pct(symbol)
+            symbol_macro_context["funding_rate"] = self.data_fetcher.fetch_funding_rate(symbol)
+            symbol_macro_context["spread_pct"] = self.data_fetcher.fetch_spread_pct(symbol)
 
-            rule_signal, diagnostics = self.signal_engine.get_rule_signal(symbol, df_15m, df_1h, trend_4h, symbol_macro_context)
+            rule_signal, diagnostics = self.signal_engine.get_rule_signal(symbol, df_15m, df_1h, trend, symbol_macro_context)
             if not rule_signal:
                 return True
 
@@ -1690,7 +1960,7 @@ class HybridTradingSystem:
                 if now - self.last_signal_time[symbol] < timedelta(minutes=cooldown):
                     return True
 
-            active_trades_snapshot = self.paper_trader.snapshot_active_trades()
+            active_trades_snapshot = self.active_tracker.snapshot()
             can_open, reason = self.risk_manager.can_open_trade(
                 symbol, active_trades_snapshot,
                 correlation_manager=self.correlation_manager,
@@ -1708,24 +1978,39 @@ class HybridTradingSystem:
                 return True
 
             latest = df_15m.iloc[-1]
-            trade_data = self.telegram.send_signal(symbol, rule_signal, latest, trend_4h, self.config.ENTRY_TIMEFRAME,
-                                                     judge_reason=judge["reason"], judge_confidence=judge["confidence"],
-                                                     macro_context=symbol_macro_context)
+            levels = self.signal_engine.calculate_trade_levels(symbol, rule_signal, latest, symbol_macro_context)
 
-            if trade_data:
-                self.paper_trader.open_virtual_trade(
-                    symbol=symbol,
-                    side=rule_signal,
-                    entry_price=trade_data["price"],
-                    tp1=trade_data["tp1"],
-                    tp2=trade_data["tp2"],
-                    tp3=trade_data["tp3"],
-                    sl=trade_data["sl"],
-                    qty=trade_data["qty"],
-                    atr_at_entry=trade_data["atr"],
-                    spread_pct_at_entry=symbol_macro_context.get("spread_pct")
-                )
+            # سیگنال خام عین قبل به کانال تلگرام (حتی در حالت توقف واقعی)
+            sent_ok = TelegramNotifier.send_to_channel(symbol, rule_signal, latest, trend, levels,
+                                                        judge_reason=judge["reason"], judge_confidence=judge["confidence"])
+
+            if sent_ok:
                 self.last_signal_time[symbol] = now
+                # فقط اگر محافظت روزانه اجازه بدهد، به همروش ارسال و در لیست باز ثبت می‌شود
+                if self.daily_guard.can_send_to_hamravesh():
+                    payload = {
+                        "action": "execute_trade",
+                        "symbol": symbol,
+                        "side": rule_signal,
+                        "price": levels["price"],
+                        "trend": trend,
+                        "tp1": levels["tp1"],
+                        "tp2": levels["tp2"],
+                        "tp3": levels["tp3"],
+                        "sl": levels["sl"]
+                    }
+                    self.send_signal_to_hamravesh(payload)
+                    self.active_tracker.mark_open(
+                        symbol=symbol,
+                        side=rule_signal,
+                        entry=levels["price"],
+                        sl=levels["sl"],
+                        tp1=levels["tp1"],
+                        qty=levels["qty"],
+                        notional=levels["notional"]
+                    )
+                else:
+                    logger.info(f"{symbol}: سیگنال تلگرام ارسال شد ولی به‌خاطر محافظت روزانه به همروش نرفت.")
 
             return True
 
@@ -1738,7 +2023,7 @@ class HybridTradingSystem:
         if self.last_summary_date and today != self.last_summary_date:
             summary = self.journal.build_daily_summary(self.last_summary_date)
             if summary:
-                self.telegram.send_system_status(summary)
+                TelegramNotifier.send_system_status(summary)
             self.last_summary_date = today
 
     def run_once(self):
@@ -1749,6 +2034,12 @@ class HybridTradingSystem:
             self.correlation_manager.refresh()
 
         macro_context = self._build_macro_context()
+        # چک سقف ضرر ۸٪ / قفل سود ۲٪ و تصمیم‌های AI مرتبط
+        try:
+            self.daily_guard.update_and_act(macro_context)
+        except Exception as e:
+            logger.error(f"خطا در daily_guard (ادامه بدون کرش): {e}")
+
         fetch_failures = 0
         for symbol in self.config.SYMBOLS:
             ok = self.process_symbol(symbol, macro_context)
@@ -1769,34 +2060,13 @@ class HybridTradingSystem:
             )
             self.data_outage_alert_sent = True
 
-        # توجه: مانیتورینگ معاملات باز دیگه اینجا (هر ۵ دقیقه) انجام نمی‌شه؛ یه ترد
-        # مجزا با فاصله‌ی TRADE_MONITOR_INTERVAL_SECONDS این کار رو مستقل انجام می‌ده.
+    def run_loop(self):
+        global _global_system
+        _global_system = self
 
-    def start(self):
-        logger.info("بات حرفه‌ای با مدیریت ریسک و ژورنال معاملات فعال شد")
-
-        if not self.telegram.test_connection():
-            logger.error("اتصال تلگرام برقرار نشد! توکن یا chat_id رو چک کن.")
-
-        start_message = f"""🛡 **نسخه حرفه‌ای فعال شد.**
-
-باگ ارسال پیام برطرف شد. امکانات جدید:
-• مدیریت سرمایه ریسک‌محور (ریسک {self.config.RISK_PER_TRADE_PCT}% در هر معامله)
-• محدودیت اکسپوژر همبسته داینامیک (ماتریس همبستگی، حداکثر {self.config.MAX_CORRELATED_TRADES} معامله‌ی هم‌بسته)
-• تایید ساختار بازار + چندتایم‌فریمی (15m/1h/4h) با warmup کافی برای EMA200
-• فیلتر رژیم نوسان + تریلینگ استاپ واقعی
-• مانیتورینگ لحظه‌ای معاملات باز هر {self.config.TRADE_MONITOR_INTERVAL_SECONDS} ثانیه (مستقل از چرخه‌ی اصلی)
-• مدل‌سازی کارمزد و اسلیپیج تخمینی در محاسبه‌ی سود/زیان
-• هشدار خودکار تلگرامی در صورت خطای غیرمنتظره یا قطعی داده یا قطعی اتصال به AI
-• ژورنال معاملات و گزارش روزانه Win-rate/Expectancy
-• لایه‌ی قضاوت discretionary AI روی هر سیگنال (شبیه تریدر انسانی باتجربه، حداقل اطمینان {self.config.MIN_JUDGE_CONFIDENCE}%)
-• داده‌ی فرابازاری: شاخص ترس‌وطمع، رژیم کلان بیت‌کوین، فاندینگ ریت و اسپرد لحظه‌ای (best-effort)
-• تخصصی‌شده فقط برای پوزیشن Long/BUY در بازار اسپات - هیچ سیگنال یا معامله‌ی Short/SELL دیگه صادر نمی‌شه
-• تطبیق‌پذیری واقعی با جو بازار از طریق هوش مصنوعی (بهینه‌ساز پارامتر + لایه‌ی قضاوت) - بدون شرط‌های خشک و ثابت
-"""
-        self.telegram.send_system_status(start_message)
-
-        self._start_trade_monitor_thread()
+        logger.info("بخش رندر (Render Signal Generator) با موفقیت فعال شد.")
+        threading.Thread(target=verify_and_notify_startup, args=(self.config,), daemon=True).start()
+        threading.Thread(target=self._telegram_updates_loop, daemon=True, name="TelegramCallbacks").start()
 
         while self.running:
             try:
@@ -1808,15 +2078,16 @@ class HybridTradingSystem:
                     "ربات همچنان روشنه و چرخه‌ی بعدی رو امتحان می‌کنه."
                 )
             gc.collect()
+            logger.info(f"پایان چرخه بررسی بازار. انتظار برای دور بعدی ({self.config.CHECK_INTERVAL} ثانیه)...")
             time.sleep(self.config.CHECK_INTERVAL)
 
     def stop(self):
         self.running = False
-        logger.info("بات متوقف شد")
+        logger.info("بخش رندر متوقف شد.")
 
 if __name__ == "__main__":
-    bot = HybridTradingSystem()
+    system = RenderSignalSystem()
     try:
-        bot.start()
+        system.run_loop()
     except KeyboardInterrupt:
-        bot.stop()
+        system.stop()
