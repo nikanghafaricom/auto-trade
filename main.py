@@ -94,6 +94,26 @@ class Config:
     DAILY_PROFIT_LOCK_PCT = float(os.getenv("DAILY_PROFIT_LOCK_PCT", 2.0))
     PROFIT_AI_WAIT_MINUTES = int(os.getenv("PROFIT_AI_WAIT_MINUTES", 45))
 
+    # ==================== جدید (هم‌راستا با کد ۱): لایه‌ی خودتنظیمی سراسری پرتفوی ====================
+    # این پارامترها تعیین می‌کنن ربات بر اساس چند تا از آخرین معاملات بسته‌شده (فارغ از
+    # نماد) وارد حالت CAUTION/DEFENSIVE بشه. کاملاً محاسباتیه (بدون هزینه‌ی Groq) و همیشه
+    # فعاله، حتی اگه سهمیه‌ی رایگان AI تموم بشه.
+    PORTFOLIO_ROLLING_WINDOW = int(os.getenv("PORTFOLIO_ROLLING_WINDOW", 10))
+    PORTFOLIO_MIN_SAMPLES = int(os.getenv("PORTFOLIO_MIN_SAMPLES", 6))
+    PORTFOLIO_CONSECUTIVE_LOSS_THRESHOLD = int(os.getenv("PORTFOLIO_CONSECUTIVE_LOSS_THRESHOLD", 4))
+
+    # ---- جدید (هم‌راستا با کد ۱): ارزیابی کم‌تکرار AI از رژیم کلی بازار ----
+    MARKET_REGIME_AI_INTERVAL_HOURS = int(os.getenv("MARKET_REGIME_AI_INTERVAL_HOURS", 5))
+
+    # ---- جدید (هم‌راستا با کد ۱): بودجه‌بند روزانه‌ی واقعی سهمیه‌ی Groq ----
+    GROQ_DAILY_TOKEN_CAP = int(os.getenv("GROQ_DAILY_TOKEN_CAP", 200000))
+    GROQ_DAILY_REQUEST_CAP = int(os.getenv("GROQ_DAILY_REQUEST_CAP", 1000))
+    GROQ_JUDGE_RESERVED_SHARE = float(os.getenv("GROQ_JUDGE_RESERVED_SHARE", 0.70))
+    GROQ_REGIME_RESERVED_SHARE = float(os.getenv("GROQ_REGIME_RESERVED_SHARE", 0.03))
+    GROQ_BUDGET_HARD_STOP_FRACTION = float(os.getenv("GROQ_BUDGET_HARD_STOP_FRACTION", 0.95))
+    GROQ_OPTIMIZER_MIN_INTERVAL_HOURS = float(os.getenv("GROQ_OPTIMIZER_MIN_INTERVAL_HOURS", 1.0))
+    GROQ_OPTIMIZER_MAX_INTERVAL_HOURS = float(os.getenv("GROQ_OPTIMIZER_MAX_INTERVAL_HOURS", 4.0))
+
     def validate(self):
         if not self.TELEGRAM_BOT_TOKEN or (not self.TELEGRAM_CHANNEL_ID and not self.TELEGRAM_PERSONAL_ID):
             logger.warning("هشدار: توکن یا آیدی‌های تلگرام به درستی تنظیم نشده‌اند.")
@@ -277,6 +297,111 @@ class GroqQuotaTracker:
         return (self.remaining_requests > self.JUDGE_MIN_REMAINING_REQUESTS and
                 self.remaining_tokens > self.JUDGE_MIN_REMAINING_TOKENS)
 
+# ==================== بودجه‌بند روزانه‌ی واقعی سهمیه‌ی Groq (هم‌راستا با کد ۱) ====================
+class GroqDailyBudget:
+    """
+    GroqQuotaTracker صرفاً هدرهای لحظه‌ای Groq رو منعکس می‌کنه و - طبق مستندات رسمی
+    خودِ Groq - x-ratelimit-remaining-tokens همیشه به سقف هر-دقیقه (TPM) اشاره داره،
+    نه به یک بودجه‌ی روزانه‌ی واقعی. این کلاس خودش مصرف واقعی توکن هر درخواست رو جمع
+    می‌زنه و هر نیمه‌شب صفر می‌شه، و سقف روزانه رو بین سه مصرف‌کننده اولویت‌بندی می‌کنه:
+    قضاوت معامله (اولویت اول، عملاً همیشه در دسترس)، رژیم کلی بازار (سهم ثابت کوچک) و
+    تنظیم پارامتر نمادها (باقیمانده، با فرکانس پویا بین حداقل و حداکثر تنظیم‌شده).
+    """
+    def __init__(self, config: Config):
+        self.config = config
+        self._day = date_cls.today()
+        self.tokens_used_today = 0
+        self.requests_used_today = 0
+        self.used_by_consumer = {"judge": 0, "regime": 0, "optimizer": 0}
+
+    def _roll_day_if_needed(self):
+        today = date_cls.today()
+        if today != self._day:
+            self._day = today
+            self.tokens_used_today = 0
+            self.requests_used_today = 0
+            self.used_by_consumer = {"judge": 0, "regime": 0, "optimizer": 0}
+
+    def record_usage(self, consumer: str, response_json: Optional[dict], fallback_tokens: int = 700):
+        self._roll_day_if_needed()
+        used = fallback_tokens
+        try:
+            usage = (response_json or {}).get("usage") or {}
+            total = usage.get("total_tokens")
+            if total:
+                used = int(total)
+        except Exception:
+            pass
+        self.tokens_used_today += used
+        self.requests_used_today += 1
+        self.used_by_consumer[consumer] = self.used_by_consumer.get(consumer, 0) + used
+
+    def _hard_cap_reached(self) -> bool:
+        if self.tokens_used_today >= self.config.GROQ_DAILY_TOKEN_CAP * self.config.GROQ_BUDGET_HARD_STOP_FRACTION:
+            return True
+        if self.requests_used_today >= self.config.GROQ_DAILY_REQUEST_CAP * self.config.GROQ_BUDGET_HARD_STOP_FRACTION:
+            return True
+        return False
+
+    def can_consume(self, consumer: str) -> bool:
+        self._roll_day_if_needed()
+        if self._hard_cap_reached():
+            return False
+
+        if consumer == "judge":
+            return True
+
+        if consumer == "regime":
+            reserved = self.config.GROQ_DAILY_TOKEN_CAP * self.config.GROQ_REGIME_RESERVED_SHARE
+            if self.used_by_consumer.get("regime", 0) < reserved:
+                return True
+            return self._spare_capacity_tokens() > 0
+
+        if consumer == "optimizer":
+            optimizer_share = self.config.GROQ_DAILY_TOKEN_CAP * (
+                1 - self.config.GROQ_JUDGE_RESERVED_SHARE - self.config.GROQ_REGIME_RESERVED_SHARE
+            )
+            if self.used_by_consumer.get("optimizer", 0) < optimizer_share:
+                return True
+            return self._spare_capacity_tokens() > 0
+
+        return True
+
+    def _spare_capacity_tokens(self) -> float:
+        cap = self.config.GROQ_DAILY_TOKEN_CAP * self.config.GROQ_BUDGET_HARD_STOP_FRACTION
+        return max(0.0, cap - self.tokens_used_today)
+
+    def get_optimizer_pace_ratio(self) -> float:
+        self._roll_day_if_needed()
+        now = datetime.now()
+        seconds_since_midnight = (now - datetime.combine(now.date(), datetime.min.time())).total_seconds()
+        day_fraction = max(seconds_since_midnight / 86400.0, 0.01)
+        optimizer_share_tokens = self.config.GROQ_DAILY_TOKEN_CAP * (
+            1 - self.config.GROQ_JUDGE_RESERVED_SHARE - self.config.GROQ_REGIME_RESERVED_SHARE
+        )
+        expected_used = optimizer_share_tokens * day_fraction
+        if expected_used <= 0:
+            return 1.0
+        return self.used_by_consumer.get("optimizer", 0) / expected_used
+
+    def get_dynamic_optimizer_interval(self) -> timedelta:
+        pace = self.get_optimizer_pace_ratio()
+        lo = self.config.GROQ_OPTIMIZER_MIN_INTERVAL_HOURS
+        hi = self.config.GROQ_OPTIMIZER_MAX_INTERVAL_HOURS
+        if pace > 1.3:
+            return timedelta(hours=hi)
+        if pace < 0.5:
+            return timedelta(hours=lo)
+        return timedelta(hours=(lo + hi) / 2)
+
+    def get_status_summary(self) -> str:
+        self._roll_day_if_needed()
+        return (f"مصرف امروز: {self.tokens_used_today:,}/{self.config.GROQ_DAILY_TOKEN_CAP:,} توکن "
+                f"({self.requests_used_today}/{self.config.GROQ_DAILY_REQUEST_CAP} درخواست) | "
+                f"قضاوت معامله: {self.used_by_consumer.get('judge', 0):,} | "
+                f"رژیم کلی بازار: {self.used_by_consumer.get('regime', 0):,} | "
+                f"تنظیم پارامتر: {self.used_by_consumer.get('optimizer', 0):,}")
+
 # ==================== هوش مصنوعی پیشرفته اختصاصی و ضد ضرر ====================
 class AIParameterOptimizer:
     def __init__(self, config):
@@ -298,6 +423,7 @@ class AIParameterOptimizer:
         self._last_groq_call_ts = 0.0
         # ردیاب سهمیه‌ی رایگان - بعد از هر پاسخ Groq با هدرهای واقعی خودش به‌روز می‌شه
         self.quota = GroqQuotaTracker()
+        self.budget = GroqDailyBudget(config)
         # این کالبک از بیرون ست می‌شه تا وقتی سهمیه تموم/برگشت یا اتصال قطع/برقرار شد،
         # پیام تلگرام بفرستیم
         self.on_quota_exhausted_callback: Optional[callable] = None
@@ -490,15 +616,17 @@ class AIParameterOptimizer:
         return response
 
     def should_optimize(self, symbol: str) -> bool:
-        if not self.quota.can_optimize():
+        if not self.quota.can_optimize() or not self.budget.can_consume("optimizer"):
             logger.info(f"{symbol}: تنظیم پارامتر دوره‌ای به‌خاطر کمبود سهمیه‌ی Groq این چرخه رد شد "
-                        f"(باقیمانده: {self.quota.remaining_requests} درخواست / {self.quota.remaining_tokens} توکن) - "
-                        f"سهمیه برای لایه‌ی قضاوت معامله نگه داشته می‌شه.")
+                        f"(باقیمانده‌ی لحظه‌ای: {self.quota.remaining_requests} درخواست / {self.quota.remaining_tokens} توکن | "
+                        f"بودجه‌ی روزانه: {self.budget.get_status_summary()}) - "
+                        f"سهمیه برای لایه‌ی قضاوت معامله (اولویت اول) نگه داشته می‌شه.")
             return False
         state = self.symbol_states[symbol]
         if state["last_optimized_time"] is None:
             return True
-        return datetime.now() - state["last_optimized_time"] >= self.optimization_interval
+        dynamic_interval = self.budget.get_dynamic_optimizer_interval()
+        return datetime.now() - state["last_optimized_time"] >= dynamic_interval
 
     def optimize_symbol_parameters(self, symbol: str, df_15m: pd.DataFrame, journal=None):
         if not self.groq_api_key or df_15m.empty:
@@ -533,18 +661,11 @@ Never make changes so aggressive that they would effectively stop signals from b
 """
 
         prompt = f"""
-You are an advanced quantitative trading AI whose primary job is to continuously adapt trading parameters to the CURRENT market regime so the bot does not only work right after an update and then start losing.
-
-Current market data and recent performance for {symbol}:
+You are an advanced quantitative trading AI. First, analyze the following key market data and indicators for asset {symbol}:
 {json.dumps(market_metrics)}
 {side_perf_note}
-
-CRITICAL ADAPTATION RULES:
-- If consecutive_losses is high or recent_buy_performance shows low win_rate / negative avg_r, you MUST tighten entry conditions (raise rsi_buy_min, raise volume_mult, increase cooldown_minutes, raise atr_min_filter) so fewer low-quality longs are taken until the regime improves.
-- If the market looks favorable (healthy volume, reasonable RSI zone, no heavy recent losses), you may moderately loosen parameters to capture more opportunities.
-- Never make changes so extreme that signals completely stop. Stay inside reasonable ranges.
-- Your goal is sustained positive expectancy across changing market regimes, not short-term overfit to the last few candles.
-
+Based on these specific conditions, dynamically tune the trading parameters to adapt to the current market regime.
+Keep risk management strict to prevent losses, but allow reasonable flexibility so the bot can capture valid opportunities within safe logical boundaries.
 Return ONLY valid JSON with the exact same keys as these default parameters:
 {json.dumps(state["params"])}
 No markdown formatting, no extra text.
@@ -567,6 +688,7 @@ No markdown formatting, no extra text.
             response = self._post_with_retry(f"{self.groq_endpoint}v1/chat/completions", payload, headers, timeout=25, label=symbol)
             if response.status_code == 200:
                 res_data = response.json()
+                self.budget.record_usage("optimizer", res_data, fallback_tokens=700)
                 content = res_data['choices'][0]['message']['content'].strip()
 
                 if content.startswith("```"):
@@ -586,6 +708,70 @@ No markdown formatting, no extra text.
 
     def get_params(self, symbol: str) -> dict:
         return self.symbol_states[symbol]["params"]
+
+    # ==================== جدید (هم‌راستا با کد ۱): ارزیابی سراسری رژیم کلی بازار ====================
+    def assess_market_regime(self, macro_context: dict, portfolio_stats: dict) -> Optional[dict]:
+        """
+        برخلاف optimize_symbol_parameters (که per-symbol و بر اساس اندیکاتورهای همون
+        نمادِ کار می‌کنه)، این متد یک ارزیابی سراسری و کم‌تکراره: هم زمینه‌ی کلان بازار
+        و هم عملکرد رولینگ واقعی خودِ ربات رو می‌بینه و یک "ضریب تهاجمی‌بودن"
+        (aggressiveness_mult) برمی‌گردونه که روی حجم پوزیشن‌های بعدی اعمال می‌شه. اگه AI
+        در دسترس نباشه یا سهمیه کم باشه، None برمی‌گردونه و PortfolioStateManager
+        به‌صورت خنثی (ضریب ۱.۰) ادامه می‌ده.
+        """
+        if not self.groq_api_key:
+            return None
+
+        payload_metrics = {
+            "btc_trend_4h": macro_context.get("btc_trend_4h"),
+            "btc_structure": macro_context.get("btc_structure"),
+            "btc_rsi": macro_context.get("btc_rsi"),
+            "btc_macd_hist": macro_context.get("btc_macd_hist"),
+            "btc_volatility_percentile": macro_context.get("btc_volatility_pctl"),
+            "fear_greed_index": macro_context.get("fear_greed"),
+            "portfolio_rolling_win_rate_pct": portfolio_stats.get("win_rate"),
+            "portfolio_rolling_avg_r": portfolio_stats.get("avg_r"),
+            "portfolio_consecutive_losses": portfolio_stats.get("consecutive_losses"),
+            "portfolio_sample_count": portfolio_stats.get("sample_count"),
+        }
+
+        prompt = f"""You are a senior crypto macro strategist. Assess the CURRENT overall market regime using the aggregated data below (this is portfolio-wide context, not a single-symbol signal):
+{json.dumps(payload_metrics, ensure_ascii=False)}
+
+Classify the regime and suggest how aggressively a systematic long-only crypto strategy should size its positions right now, given both the macro backdrop AND this bot's own recent live trading performance. If recent performance is weak or the regime looks unfavorable for longs, lean toward a lower multiplier; if the regime is clearly favorable and performance is healthy, a multiplier near or slightly above 1.0 is fine.
+
+Respond ONLY with valid JSON, no markdown, no extra text, exactly this shape:
+{{"market_regime": "trending_bullish" or "trending_bearish" or "choppy_range" or "high_volatility" or "uncertain", "aggressiveness_mult": number between 0.5 and 1.15, "reasoning": "one concise sentence in Persian"}}
+"""
+        headers = {"Authorization": f"Bearer {self.groq_api_key}", "Content-Type": "application/json"}
+        payload = {
+            "model": "openai/gpt-oss-120b",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+            "reasoning_effort": "low",
+            "max_tokens": 400
+        }
+        try:
+            response = self._post_with_retry(f"{self.groq_endpoint}v1/chat/completions", payload, headers, timeout=20, label="PORTFOLIO_REGIME")
+            if response.status_code != 200:
+                logger.warning(f"ارزیابی رژیم کلی بازار پاسخ {response.status_code} داد؛ ضریب قبلی حفظ می‌شه.")
+                return None
+            res_data = response.json()
+            self.budget.record_usage("regime", res_data, fallback_tokens=400)
+            content = res_data['choices'][0]['message']['content'].strip()
+            if content.startswith("```"):
+                content = content.strip("`").replace("json\n", "").strip()
+            if not content:
+                return None
+            result = json.loads(content)
+            mult = max(0.5, min(1.15, float(result.get("aggressiveness_mult", 1.0))))
+            regime = str(result.get("market_regime", "uncertain"))
+            reasoning = str(result.get("reasoning", ""))[:300]
+            logger.info(f"ارزیابی رژیم کلی بازار: {regime} | ضریب تهاجمی‌بودن: {mult:.2f} | {reasoning}")
+            return {"market_regime": regime, "aggressiveness_mult": mult, "reasoning": reasoning}
+        except Exception as e:
+            logger.error(f"خطا در ارزیابی رژیم کلی بازار: {e}")
+            return None
 
     def _alert_judge_error(self, message: str):
         """هشدار خطای عمومی لایه‌ی قضاوت (پاسخ 200 اما غیرمنتظره/غیر-JSON، یا هر خطای
@@ -614,7 +800,7 @@ No markdown formatting, no extra text.
         if not self.groq_api_key:
             return default
 
-        if self.quota.can_judge():
+        if self.quota.can_judge() and self.budget.can_consume("judge"):
             if self._judge_quota_alert_sent:
                 self._judge_quota_alert_sent = False
                 if self.on_quota_exhausted_callback:
@@ -630,10 +816,11 @@ No markdown formatting, no extra text.
                 if self.on_quota_exhausted_callback:
                     try:
                         self.on_quota_exhausted_callback(
-                            "⚠️ سهمیه‌ی رایگان Groq برای امروز تموم شد.\n\n"
+                            "⚠️ سهمیه‌ی رایگان Groq برای امروز تموم شد (یا به خط قرمز نهایی بودجه‌ی روزانه رسیده).\n\n"
+                            f"وضعیت بودجه: {self.budget.get_status_summary()}\n\n"
                             "طبق تنظیم فعلی، تا برگشتن سهمیه:\n"
                             "• هیچ سیگنال یا معامله‌ی جدیدی ارسال نمی‌شه (تایید AI الزامیه)\n"
-                            "• تنظیم پارامتر دوره‌ای متوقفه (آخرین پارامترهای تنظیم‌شده توسط AI همچنان استفاده می‌شن)"
+                            "• تنظیم پارامتر دوره‌ای و ارزیابی رژیم کلی بازار متوقفن (آخرین مقادیر همچنان استفاده می‌شن)"
                         )
                     except Exception:
                         pass
@@ -641,26 +828,14 @@ No markdown formatting, no extra text.
             return {"approve": False, "confidence": 0,
                     "reason": "سهمیه‌ی رایگان Groq تموم شده - طبق تنظیم، سیگنال رد شد (تایید AI الزامیه)"}
 
-        prompt = f"""You are a veteran discretionary crypto trader with 15+ years of experience. Markets constantly change regime. Your job is NOT to approve every technically valid setup. Your job is to decide whether the CURRENT market regime actually favors a LONG right now.
+        prompt = f"""You are a veteran discretionary crypto trader with 15+ years of experience. You deeply understand that markets are not static: regimes shift, correlations break down, momentum exhausts, and no fixed rule set can fully capture that. You are reviewing a trade candidate that ALREADY passed a strict quantitative multi-factor scoring system (trend, RSI momentum, MACD, volume, market structure, multi-timeframe alignment, volatility regime).
 
-The candidate already passed quantitative filters. You must now answer:
-1. Is the broader market regime (trend, structure, BTC behavior, fear/greed, recent performance of this symbol) supportive of a new LONG?
-2. Or is the environment uncertain / choppy / bearish / recently losing, so this long should be skipped even if the indicators look okay?
-
-Be especially strict and prefer REJECT when any of these are true:
-- consecutive_losses_this_symbol > 0 or recent buy performance is weak
-- trend_4h is NEUTRAL or BEARISH
-- market structure is not clearly BULLISH
-- BTC macro trend/structure shows uncertainty or weakness
-- volume is weak or erratic
-- the overall picture feels like the bot is about to repeat a losing streak
-
-Only approve when you genuinely believe the current regime supports a long with positive expectancy. When in doubt, reject.
+Your only job now is the kind of contextual judgment an elite human trader adds on top of a systematic setup: given everything below, does the broader picture actually support taking this trade right now, or is there something about the current context (exhaustion, conflicting signals, thin/erratic volume, the symbol's recent losing streak, over-extension, or a portfolio-wide defensive state) that says skip it even though the numbers look fine?
 
 Trade candidate:
 Symbol: {symbol}
 Side: {side}
-Full context: {json.dumps(context, ensure_ascii=False)}
+Full context (includes portfolio_state / portfolio_rolling_stats fields showing this bot's own recent aggregate performance across ALL symbols, not just this one): {json.dumps(context, ensure_ascii=False)}
 
 Respond ONLY with valid JSON, no markdown, no extra text, in exactly this shape:
 {{"approve": true or false, "confidence": integer 0-100, "reason": "one concise sentence in Persian explaining the judgment"}}
@@ -682,7 +857,9 @@ Respond ONLY with valid JSON, no markdown, no extra text, in exactly this shape:
                     "طبق تنظیم فعلی، تا رفع این مشکل هیچ سیگنال یا معامله‌ی جدیدی ارسال نمی‌شه (تایید AI الزامیه)."
                 )
                 return default
-            content = response.json()['choices'][0]['message']['content'].strip()
+            res_data = response.json()
+            self.budget.record_usage("judge", res_data, fallback_tokens=500)
+            content = res_data['choices'][0]['message']['content'].strip()
             if content.startswith("```"):
                 content = content.strip("`").replace("json\n", "").strip()
             if not content:
@@ -701,6 +878,126 @@ Respond ONLY with valid JSON, no markdown, no extra text, in exactly this shape:
                 "طبق تنظیم فعلی، تا رفع این مشکل هیچ سیگنال یا معامله‌ی جدیدی ارسال نمی‌شه (تایید AI الزامیه)."
             )
             return default
+
+# ==================== جدید (هم‌راستا با کد ۱): مدیریت وضعیت سراسری پرتفوی ====================
+class PortfolioStateManager:
+    """
+    لایه‌ی سراسری (سطح کل پرتفوی، نه یک نماد خاص) که وضعیت عملکرد اخیر ربات رو
+    زیر نظر می‌گیره و بر اساس اون، سخت‌گیری کل سیستم رو خودکار تنظیم می‌کنه - دقیقاً
+    برای اینکه دیگه لازم نباشه هر بار که جوی بازار عوض شد و ربات شروع به ضررده‌شدن
+    کرد، کسی دستی متوجه بشه و تنظیمات رو عوض کنه.
+
+    سه حالت:
+      NORMAL     : عملکرد اخیر سالمه - تنظیمات پیش‌فرض
+      CAUTION    : عملکرد اخیر رو به ضعفه - آستانه‌ی ورود بالاتر، حجم کمتر، کول‌داون بیشتر
+      DEFENSIVE  : ضررهای پیاپی یا expectancy منفی واضح - سخت‌گیری حداکثری + فقط روند
+                   خالص BULLISH (نه NEUTRAL) مجاز به سیگنال‌دهیه
+
+    تصمیم‌گیری اصلی صرفاً روی داده‌ی واقعی معاملات بسته‌شده‌ی خودِ ربات (ژورنال) گرفته
+    می‌شه - کاملاً محاسباتیه، هیچ هزینه‌ی Groq نداره و همیشه فعاله. علاوه بر این، یک
+    ارزیابیِ کم‌تکرار و اختیاریِ AI از رژیم کلی بازار می‌تونه یک ضریب تهاجمی‌بودن اضافه
+    اعمال کنه؛ پیش‌فرضش خنثیه (۱.۰).
+
+    نکته‌ی فنی: در نسخه‌ی رندر، اعلان تغییر حالت مستقیماً از طریق TelegramNotifier
+    (کلاس استاتیک همین پروژه) فرستاده می‌شه، چون این پروژه instance جدا برای ارسال
+    پیام نداره - این فقط یک تطبیق سطح ارسال پیامه و هیچ اثری روی منطق تصمیم‌گیری نداره.
+    """
+    def __init__(self, config: Config, journal: "TradeJournal"):
+        self.config = config
+        self.journal = journal
+        self.state = "NORMAL"
+        self.last_stats: Dict = {}
+        self.ai_regime: Dict = {"market_regime": "uncertain", "aggressiveness_mult": 1.0, "reasoning": ""}
+        self._last_ai_regime_time: Optional[datetime] = None
+
+    def _consecutive_losses_global(self) -> int:
+        count = 0
+        for r in reversed(self.journal.records):
+            if r["pnl_usdt"] <= 0:
+                count += 1
+            else:
+                break
+        return count
+
+    def get_stats(self) -> Dict:
+        recent = self.journal.records[-self.config.PORTFOLIO_ROLLING_WINDOW:]
+        if not recent:
+            return {"sample_count": 0, "win_rate": None, "avg_r": None, "consecutive_losses": 0}
+        wins = [r for r in recent if r["pnl_usdt"] > 0]
+        return {
+            "sample_count": len(recent),
+            "win_rate": round(len(wins) / len(recent) * 100, 1),
+            "avg_r": round(sum(r["r_multiple"] for r in recent) / len(recent), 2),
+            "consecutive_losses": self._consecutive_losses_global()
+        }
+
+    def recompute(self) -> str:
+        prev_state = self.state
+        stats = self.get_stats()
+        self.last_stats = stats
+
+        if stats["sample_count"] < self.config.PORTFOLIO_MIN_SAMPLES:
+            new_state = "NORMAL"
+        elif (stats["consecutive_losses"] >= self.config.PORTFOLIO_CONSECUTIVE_LOSS_THRESHOLD
+              or stats["avg_r"] <= -0.3 or stats["win_rate"] < 30):
+            new_state = "DEFENSIVE"
+        elif stats["avg_r"] <= 0.05 or stats["win_rate"] < 45:
+            new_state = "CAUTION"
+        else:
+            new_state = "NORMAL"
+
+        self.state = new_state
+        if new_state != prev_state:
+            self._notify_transition(prev_state, new_state, stats)
+        return self.state
+
+    def _notify_transition(self, prev_state: str, new_state: str, stats: Dict):
+        labels = {"NORMAL": "🟢 عادی", "CAUTION": "🟡 محتاط", "DEFENSIVE": "🔴 تدافعی"}
+        msg = f"""
+🧭 **تغییر خودکار حالت پرتفوی: {labels.get(prev_state, prev_state)} ← {labels.get(new_state, new_state)}**
+
+بر اساس {stats['sample_count']} رخداد اخیر معاملاتی (همه‌ی نمادها):
+📈 نرخ برد رولینگ: {stats['win_rate']}%
+📐 میانگین R رولینگ: {stats['avg_r']:+.2f}R
+🔻 ضررهای متوالی فعلی (سراسری): {stats['consecutive_losses']}
+
+"""
+        if new_state == "DEFENSIVE":
+            msg += ("ربات وارد حالت تدافعی شد: آستانه‌ی امتیاز ورود و حداقل اطمینان AI بالاتر رفت، حجم پوزیشن کاهش "
+                    "یافت و فقط روند خالص صعودی (نه خنثی) مجاز به سیگنال‌دهیه. این یعنی روش فعلی در جوی فعلی بازار "
+                    "داره ضرر می‌ده و ربات خودش سخت‌گیرتر شد - بدون نیاز به دخالت دستی. تا بهبود عملکرد رولینگ ادامه پیدا می‌کنه.")
+        elif new_state == "CAUTION":
+            msg += "ربات وارد حالت محتاط شد: سخت‌گیری کمی بیشتر و حجم کمتر تا روشن‌ترشدن جهت بازار."
+        else:
+            msg += "عملکرد اخیر به حالت سالم برگشت - سخت‌گیری اضافه‌ی حالت قبلی برداشته شد و ربات به تنظیمات عادی برگشت."
+        try:
+            TelegramNotifier.send_to_personal(msg)
+        except Exception as e:
+            logger.error(f"خطا در ارسال پیام تغییر حالت پرتفوی: {e}")
+
+    def should_refresh_ai_regime(self) -> bool:
+        if self._last_ai_regime_time is None:
+            return True
+        return datetime.now() - self._last_ai_regime_time >= timedelta(hours=self.config.MARKET_REGIME_AI_INTERVAL_HOURS)
+
+    def set_ai_regime(self, result: Optional[Dict]):
+        self._last_ai_regime_time = datetime.now()
+        if result:
+            self.ai_regime = result
+
+    def get_adjustments(self) -> Dict:
+        presets = {
+            "NORMAL":    {"score_adjustment": 0.0, "confidence_adjustment": 0,  "size_mult": 1.0,  "cooldown_mult": 1.0},
+            "CAUTION":   {"score_adjustment": 1.0, "confidence_adjustment": 10, "size_mult": 0.75, "cooldown_mult": 1.3},
+            "DEFENSIVE": {"score_adjustment": 2.0, "confidence_adjustment": 20, "size_mult": 0.5,  "cooldown_mult": 1.8},
+        }
+        adj = dict(presets[self.state])
+        ai_mult = (self.ai_regime or {}).get("aggressiveness_mult", 1.0)
+        adj["size_mult"] = max(0.3, min(1.2, adj["size_mult"] * ai_mult))
+        adj["defensive"] = (self.state == "DEFENSIVE")
+        adj["state"] = self.state
+        adj["ai_market_regime"] = (self.ai_regime or {}).get("market_regime")
+        return adj
 
 # ==================== موتور سیگنال امتیازی چندلایه ====================
 class SignalEngine:
@@ -758,7 +1055,7 @@ class SignalEngine:
         return score
 
     def get_rule_signal(self, symbol: str, df_15m: pd.DataFrame, df_1h: pd.DataFrame, trend_4h: str,
-                         macro_context: Optional[dict] = None, peer_context: Optional[dict] = None) -> Tuple[Optional[str], dict]:
+                         macro_context: Optional[dict] = None, portfolio_adjustments: Optional[dict] = None) -> Tuple[Optional[str], dict]:
         if df_15m.empty or len(df_15m) < 30:
             return None, {}
 
@@ -779,6 +1076,10 @@ class SignalEngine:
             return None, {}
 
         macro_context = macro_context or {}
+        portfolio_adjustments = portfolio_adjustments or {}
+        score_adjustment = portfolio_adjustments.get("score_adjustment", 0.0)
+        defensive_mode = portfolio_adjustments.get("defensive", False)
+
         fng = macro_context.get("fear_greed")
         btc_trend_4h = macro_context.get("btc_trend_4h")
         btc_structure = macro_context.get("btc_structure")
@@ -799,11 +1100,17 @@ class SignalEngine:
         structure = self.analysis.market_structure(df_15m)
 
         # ---- فقط پوزیشن Long/BUY (اسپات) ----
-        # فیلتر سخت و ثابت رژیم بازار حذف شد.
-        # حالا بار اصلی تشخیص «آیا الان جو بازار برای لانگ مناسب است؟»
-        # روی لایه‌ی قضاوت هوش مصنوعی (Judge) و بهینه‌ساز پارامترهاست
-        # تا ربات خودش را با تغییر جو بازار تطبیق دهد، نه با شرط‌های خشک.
-        buy_score = self._score_buy(latest, prev, p) if trend_4h in ["BULLISH", "NEUTRAL"] else 0.0
+        # در حالت DEFENSIVE پرتفوی (چند ضرر متوالی/expectancy منفی)، حالت NEUTRAL+ساختار
+        # صعودی دیگه مجاز نیست و فقط روند خالص BULLISH در تایم‌فریم 4h سیگنال می‌ده - این
+        # همون جایی‌یه که سیستم به‌خاطر عملکرد ضعیف اخیر، خودش سخت‌گیرتر شده.
+        if defensive_mode:
+            buy_score = self._score_buy(latest, prev, p) if trend_4h == "BULLISH" else 0.0
+        elif trend_4h == "BULLISH":
+            buy_score = self._score_buy(latest, prev, p)
+        elif trend_4h == "NEUTRAL" and structure == "BULLISH":
+            buy_score = self._score_buy(latest, prev, p) * 0.85
+        else:
+            buy_score = 0.0
 
         if trend_4h == "BULLISH":
             buy_score += 1.0
@@ -853,7 +1160,9 @@ class SignalEngine:
                 elif ref_health < -0.4:
                     buy_score -= 0.5
 
-        threshold = self.config.MIN_SIGNAL_SCORE
+        # آستانه‌ی پویا: در حالت CAUTION/DEFENSIVE سخت‌گیرتر می‌شه (score_adjustment از
+        # PortfolioStateManager می‌آد)، بدون اینکه نیاز باشه کسی دستی این عدد رو عوض کنه.
+        threshold = self.config.MIN_SIGNAL_SCORE + score_adjustment
         vol_ratio = latest['volume'] / latest['vol_sma'] if latest['vol_sma'] else 0
         diagnostics = {
             "structure": structure,
@@ -873,10 +1182,14 @@ class SignalEngine:
             "btc_aligned_now": btc_aligned_now,
             "btc_rsi": round(btc_rsi, 1) if btc_rsi is not None else None,
             "btc_macd_hist": round(btc_macd_hist, 6) if btc_macd_hist is not None else None,
+            "portfolio_state": portfolio_adjustments.get("state"),
+            "portfolio_ai_market_regime": portfolio_adjustments.get("ai_market_regime"),
+            "signal_threshold_used": round(threshold, 2),
         }
         macro_log = (f"FNG={fng} BTC_trend={btc_trend_4h}/{btc_structure} BTC_RSI={diagnostics['btc_rsi']} "
                      f"BTC_MACD={diagnostics['btc_macd_hist']} funding={funding_rate} "
-                     f"spread={diagnostics['spread_pct']} btc_ref={btc_reference_trade} aligned={btc_aligned_now}")
+                     f"spread={diagnostics['spread_pct']} btc_ref={btc_reference_trade} aligned={btc_aligned_now} "
+                     f"portfolio_state={diagnostics['portfolio_state']}")
         if buy_score >= threshold:
             diagnostics["quant_score"] = round(buy_score, 2)
             logger.info(f"{symbol}: امتیاز خرید {buy_score:.2f} (آستانه {threshold}) | ساختار: {structure} | {macro_log}")
@@ -884,8 +1197,10 @@ class SignalEngine:
 
         return None, {}
 
-    def calculate_trade_levels(self, symbol: str, side: str, latest: pd.Series, macro_context: Optional[dict] = None) -> dict:
-        """محاسبه‌ی قیمت ورود، حد ضرر، تارگت‌ها و پیشنهاد حجم - عین منطق کد ۱."""
+    def calculate_trade_levels(self, symbol: str, side: str, latest: pd.Series, macro_context: Optional[dict] = None,
+                                portfolio_size_mult: float = 1.0) -> dict:
+        """محاسبه‌ی قیمت ورود، حد ضرر، تارگت‌ها و پیشنهاد حجم - عین منطق کد ۱ (شامل ضریب
+        حجم سراسری پرتفوی، ترکیب‌شده با ضریب استرس نوسان لحظه‌ای)."""
         price = float(latest['close'])
         atr = float(latest['atr']) if not pd.isna(latest['atr']) else price * 0.01
 
@@ -909,6 +1224,10 @@ class SignalEngine:
         btc_volatility_pctl = (macro_context or {}).get("btc_volatility_pctl")
         stress_active = btc_volatility_pctl is not None and btc_volatility_pctl >= p["stress_pctl_threshold"]
         size_mult = p["stress_size_mult"] if stress_active else 1.0
+
+        # ضریب حجم پرتفوی (از PortfolioStateManager: هم حالت CAUTION/DEFENSIVE و هم
+        # ضریب تهاجمی‌بودنِ AI رژیم کلی بازار، اگه در دسترس باشه) روی حجم پایه ضرب می‌شه.
+        size_mult = max(0.2, size_mult * portfolio_size_mult)
 
         risk_amount = self.config.VIRTUAL_CAPITAL_USDT * (self.config.RISK_PER_TRADE_PCT / 100) * size_mult
         risk_per_unit = abs(price - stop_loss)
@@ -1203,7 +1522,7 @@ class ActivePositionsTracker:
 class TelegramNotifier:
     @staticmethod
     def send_to_channel(symbol: str, side: str, latest: pd.Series, trend_4h: str, levels: dict,
-                         judge_reason: str = "", judge_confidence: int = 0):
+                         judge_reason: str = "", judge_confidence: int = 0, portfolio_state: str = "NORMAL"):
         config = Config()
         if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHANNEL_ID:
             return True  # کانال تنظیم نشده: مثل قبل، بقیه‌ی مسیر ادامه پیدا می‌کنه
@@ -1217,7 +1536,12 @@ class TelegramNotifier:
 
             stress_note = ""
             if levels["stress_active"]:
-                stress_note = f"\n⚠️ **استرس بازار شناسایی شد** (نوسان بیت‌کوین در پرسنتایل {levels['btc_volatility_pctl']:.0f}) - حجم پوزیشن به {levels['size_mult']*100:.0f}٪ حجم عادی کاهش یافت\n"
+                stress_note = f"\n⚠️ **استرس بازار شناسایی شد** (نوسان بیت‌کوین در پرسنتایل {levels['btc_volatility_pctl']:.0f}) - حجم پوزیشن به‌خاطر این عامل کاهش یافت\n"
+
+            portfolio_note = ""
+            if portfolio_state != "NORMAL":
+                label = "🟡 محتاط" if portfolio_state == "CAUTION" else "🔴 تدافعی"
+                portfolio_note = f"\n🧭 **حالت خودکار پرتفوی:** {label} (به‌خاطر عملکرد رولینگ اخیر، حجم و سخت‌گیری تنظیم شد)\n"
 
             message = f"""
 {emoji} **ANTI-LOSS ULTRA SIGNAL: {side} / {direction}**
@@ -1234,8 +1558,8 @@ class TelegramNotifier:
 
 🛑 **Stop-Loss:** {stop_loss:,}
 ⚖️ **R:R تا TP1:** 1:{rr_ratio:.2f}
-{stress_note}
-💰 **پیشنهاد حجم (ریسک {config.RISK_PER_TRADE_PCT}% سرمایه):**
+{stress_note}{portfolio_note}
+💰 **پیشنهاد حجم (ریسک {config.RISK_PER_TRADE_PCT}% سرمایه × ضریب {levels['size_mult']:.2f}):**
   مقدار: {qty:.6f} | ارزش: {notional:,.2f} USDT
 
 📊 **Metrics:** RSI: {latest['rsi']:.1f} | Market Guardrails Active
@@ -1774,6 +2098,8 @@ class RenderSignalSystem:
         self.signal_engine = SignalEngine(self.config, self.ai_optimizer, self.analysis)
         self.risk_manager = RiskManager(self.config)
         self.journal = TradeJournal()
+        # جدید (هم‌راستا با کد ۱): لایه‌ی خودتنظیمی سراسری پرتفوی
+        self.portfolio_state = PortfolioStateManager(self.config, self.journal)
         # ردیاب سبک معاملات باز واقعی (بدون شبیه‌سازی مجازی)
         self.active_tracker = ActivePositionsTracker()
         self.correlation_manager = CorrelationManager(self.config, self.data_fetcher)
@@ -1828,6 +2154,14 @@ class RenderSignalSystem:
                 self.ai_optimizer.register_win(symbol)
             else:
                 self.ai_optimizer.register_loss(symbol)
+
+            # جدید (هم‌راستا با کد ۱): بلافاصله بعد از ثبت هر رخداد واقعی، وضعیت سراسری
+            # پرتفوی بازمحاسبه می‌شه - یعنی سیستم همون لحظه (نه فقط چرخه‌ی ۵ دقیقه‌ای
+            # بعدی) می‌تونه وارد حالت CAUTION/DEFENSIVE بشه اگه ضررهای متوالی به آستانه برسه.
+            try:
+                self.portfolio_state.recompute()
+            except Exception as e:
+                logger.error(f"خطا در بازمحاسبه‌ی وضعیت پرتفوی: {e}")
 
             logger.info(f"فیدبک واقعی ثبت شد: {symbol} | pnl={pnl_pct:+.2f}% | R≈{r_multiple:+.2f}")
         except Exception as e:
@@ -1949,13 +2283,19 @@ class RenderSignalSystem:
             symbol_macro_context["funding_rate"] = self.data_fetcher.fetch_funding_rate(symbol)
             symbol_macro_context["spread_pct"] = self.data_fetcher.fetch_spread_pct(symbol)
 
-            rule_signal, diagnostics = self.signal_engine.get_rule_signal(symbol, df_15m, df_1h, trend, symbol_macro_context)
+            # جدید (هم‌راستا با کد ۱): وضعیت خودکار پرتفوی همین الان می‌گیریم - قبلاً هم
+            # در run_once و هم بعد از هر فیدبک واقعی بسته‌شدن معامله بازمحاسبه شده.
+            portfolio_adjustments = self.portfolio_state.get_adjustments()
+
+            rule_signal, diagnostics = self.signal_engine.get_rule_signal(
+                symbol, df_15m, df_1h, trend, symbol_macro_context, portfolio_adjustments
+            )
             if not rule_signal:
                 return True
 
             now = datetime.now()
             p = self.ai_optimizer.get_params(symbol)
-            cooldown = p.get("cooldown_minutes", 90)
+            cooldown = p.get("cooldown_minutes", 90) * portfolio_adjustments.get("cooldown_mult", 1.0)
             if symbol in self.last_signal_time:
                 if now - self.last_signal_time[symbol] < timedelta(minutes=cooldown):
                     return True
@@ -1972,17 +2312,28 @@ class RenderSignalSystem:
 
             diagnostics["open_positions_count"] = len(active_trades_snapshot)
             diagnostics["today_realized_pnl_usdt"] = round(self.journal.get_today_realized_pnl_usdt(), 2)
+            diagnostics["portfolio_rolling_stats"] = self.portfolio_state.last_stats
+
             judge = self.ai_optimizer.evaluate_trade_candidate(symbol, rule_signal, diagnostics)
-            if not judge["approve"] or judge["confidence"] < self.config.MIN_JUDGE_CONFIDENCE:
-                logger.info(f"{symbol}: سیگنال {rule_signal} توسط لایه‌ی قضاوت AI رد شد (اطمینان {judge['confidence']}%) - {judge['reason']}")
+
+            # در حالت CAUTION/DEFENSIVE، حداقل اطمینان لازم از لایه‌ی قضاوت AI هم بالاتر
+            # می‌ره - یعنی سیستم فقط سخت‌گیرتر روی امتیاز کمی نمی‌شه، روی تایید کیفی AI
+            # هم سخت‌گیرتر می‌شه.
+            required_confidence = min(90, self.config.MIN_JUDGE_CONFIDENCE + portfolio_adjustments.get("confidence_adjustment", 0))
+            if not judge["approve"] or judge["confidence"] < required_confidence:
+                logger.info(f"{symbol}: سیگنال {rule_signal} توسط لایه‌ی قضاوت AI رد شد (اطمینان {judge['confidence']}%، حداقل لازم {required_confidence}%) - {judge['reason']}")
                 return True
 
             latest = df_15m.iloc[-1]
-            levels = self.signal_engine.calculate_trade_levels(symbol, rule_signal, latest, symbol_macro_context)
+            levels = self.signal_engine.calculate_trade_levels(
+                symbol, rule_signal, latest, symbol_macro_context,
+                portfolio_size_mult=portfolio_adjustments.get("size_mult", 1.0)
+            )
 
             # سیگنال خام عین قبل به کانال تلگرام (حتی در حالت توقف واقعی)
             sent_ok = TelegramNotifier.send_to_channel(symbol, rule_signal, latest, trend, levels,
-                                                        judge_reason=judge["reason"], judge_confidence=judge["confidence"])
+                                                        judge_reason=judge["reason"], judge_confidence=judge["confidence"],
+                                                        portfolio_state=portfolio_adjustments.get("state", "NORMAL"))
 
             if sent_ok:
                 self.last_signal_time[symbol] = now
@@ -2023,6 +2374,7 @@ class RenderSignalSystem:
         if self.last_summary_date and today != self.last_summary_date:
             summary = self.journal.build_daily_summary(self.last_summary_date)
             if summary:
+                summary += f"\n💳 **وضعیت سهمیه‌ی Groq تا این لحظه:** {self.ai_optimizer.budget.get_status_summary()}\n"
                 TelegramNotifier.send_system_status(summary)
             self.last_summary_date = today
 
@@ -2030,10 +2382,27 @@ class RenderSignalSystem:
         logger.info("----- شروع آنالیز ایمن و ضد ضرر بازار -----")
         self._check_daily_rollover()
 
+        # جدید (هم‌راستا با کد ۱): وضعیت خودکار پرتفوی هر چرخه بازمحاسبه می‌شه (ضمن
+        # اینکه بعد از هر فیدبک واقعی بسته‌شدن معامله هم بلافاصله بازمحاسبه می‌شه - این
+        # یکی صرفاً برای اطمینانه)
+        self.portfolio_state.recompute()
+
         if self.correlation_manager.should_refresh():
             self.correlation_manager.refresh()
 
         macro_context = self._build_macro_context()
+
+        # جدید (هم‌راستا با کد ۱): ارزیابی کم‌تکرار AI از رژیم کلی بازار - فقط وقتی
+        # سهمیه‌ی Groq اجازه بده، وگرنه بدون مزاحمت رد می‌شه و سیستم به لایه‌ی محاسباتی
+        # پرتفوی تکیه می‌کنه.
+        if self.portfolio_state.should_refresh_ai_regime():
+            if self.ai_optimizer.quota.can_optimize() and self.ai_optimizer.budget.can_consume("regime"):
+                regime_result = self.ai_optimizer.assess_market_regime(macro_context, self.portfolio_state.get_stats())
+                self.portfolio_state.set_ai_regime(regime_result)
+            else:
+                logger.info(f"ارزیابی رژیم کلی بازار به‌خاطر کمبود سهمیه‌ی Groq این چرخه رد شد - ضریب قبلی حفظ می‌شه. "
+                            f"({self.ai_optimizer.budget.get_status_summary()})")
+
         # چک سقف ضرر ۸٪ / قفل سود ۲٪ و تصمیم‌های AI مرتبط
         try:
             self.daily_guard.update_and_act(macro_context)
